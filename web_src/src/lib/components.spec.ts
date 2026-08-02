@@ -29,6 +29,56 @@ describe("components visibility helpers", () => {
     expect(isFieldVisible(field, { provider: "github", token: "" })).toBe(false);
   });
 
+  // parseDefaultValues does not descend into list item schemas, so an item
+  // saved before a discriminator field existed has no value for it. Components
+  // that add such a discriminator must list "" among the accepted values, or
+  // filterVisibleConfiguration drops the data those older items still carry.
+  it("keeps a gated list item field when the discriminator is absent and the condition accepts an empty value", () => {
+    const fields = [
+      buildField({
+        name: "environment",
+        type: "list",
+        typeOptions: {
+          list: {
+            itemDefinition: {
+              schema: [
+                buildField({ name: "name" }),
+                buildField({ name: "valueSource", type: "select" }),
+                buildField({
+                  name: "value",
+                  visibilityConditions: [{ field: "valueSource", values: ["literal", ""] }],
+                }),
+                buildField({
+                  name: "secret",
+                  visibilityConditions: [{ field: "valueSource", values: ["secret"] }],
+                }),
+              ],
+            },
+          },
+        },
+      }),
+    ];
+
+    expect(
+      filterVisibleConfiguration(
+        {
+          environment: [
+            { name: "LEGACY", value: "production" },
+            { name: "EXPLICIT", valueSource: "literal", value: "staging" },
+            { name: "SECRET", valueSource: "secret", secret: { secret: "prod-db", key: "password" } },
+          ],
+        },
+        fields,
+      ),
+    ).toEqual({
+      environment: [
+        { name: "LEGACY", value: "production" },
+        { name: "EXPLICIT", valueSource: "literal", value: "staging" },
+        { name: "SECRET", valueSource: "secret", secret: { secret: "prod-db", key: "password" } },
+      ],
+    });
+  });
+
   it("treats boolean true/false as the string values 'true'/'false'", () => {
     // Boolean config fields gate dependents via values: ["true"] (e.g. memory
     // components list mode). The helper stringifies the actual value before

@@ -7,11 +7,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mitchellh/mapstructure"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/superplanehq/superplane/pkg/configuration"
 	"github.com/superplanehq/superplane/pkg/core"
+	"github.com/superplanehq/superplane/test/support/contexts"
 )
 
 // Legacy SSH nodes were saved before the commandSource field existed, so their
@@ -586,19 +588,49 @@ func TestSSHCommand_BuildRemoteCommand(t *testing.T) {
 	c := &SSHCommand{}
 
 	t.Run("command only", func(t *testing.T) {
-		command := c.buildRemoteCommand("", nil, "echo hello")
+		command, payload := c.buildRemoteCommand("", nil, "echo hello")
 		assert.Equal(t, "echo hello", command)
+		assert.Empty(t, payload)
 	})
 
 	t.Run("working directory is shell quoted", func(t *testing.T) {
-		command := c.buildRemoteCommand("/opt/app's hardening", nil, "bash run.sh")
+		command, payload := c.buildRemoteCommand("/opt/app's hardening", nil, "bash run.sh")
 		assert.Equal(t, "cd '/opt/app'\"'\"'s hardening' && bash run.sh", command)
+		assert.Empty(t, payload)
+	})
+
+	// Single-line commands leave stdin unused, so secret values ride there as
+	// export statements. `sh -lc` is kept so login-shell PATH still applies.
+	t.Run("secret values are sourced from stdin and never reach the command line", func(t *testing.T) {
+		command, payload := c.buildRemoteCommand(
+			"",
+			[]resolvedEnvVar{
+				{Name: "PUBLIC", Value: "prod"},
+				{Name: "TOKEN", Value: "t0k", Secret: true},
+			},
+			"docker run --rm app",
+		)
+
+		assert.Equal(t, `env PUBLIC='prod' sh -lc 'eval "$(cat)" && docker run --rm app'`, command)
+		assert.Equal(t, "export TOKEN='t0k'\n", payload)
+		assert.NotContains(t, command, "t0k")
+	})
+
+	t.Run("a secret with no literal still runs through the login shell", func(t *testing.T) {
+		command, payload := c.buildRemoteCommand(
+			"/srv",
+			[]resolvedEnvVar{{Name: "TOKEN", Value: "t0k", Secret: true}},
+			"deploy.sh",
+		)
+
+		assert.Equal(t, `sh -lc 'eval "$(cat)" && cd '"'"'/srv'"'"' && deploy.sh'`, command)
+		assert.Equal(t, "export TOKEN='t0k'\n", payload)
 	})
 
 	t.Run("environment values are shell quoted and command wrapped", func(t *testing.T) {
-		command := c.buildRemoteCommand(
+		command, _ := c.buildRemoteCommand(
 			"",
-			[]EnvironmentVariable{
+			[]resolvedEnvVar{
 				{Name: "PLAIN", Value: "ok"},
 				{Name: "SPECIAL", Value: "a'b;$PATH $(whoami)"},
 			},
@@ -657,7 +689,7 @@ func TestSSHCommand_BuildScriptCommand(t *testing.T) {
 		script := "echo \"$NAME\""
 		command, payload := c.buildScriptCommand(
 			"",
-			[]EnvironmentVariable{
+			[]resolvedEnvVar{
 				{Name: "NAME", Value: "world"},
 				{Name: "TOKEN", Value: "a'b"},
 			},
@@ -665,6 +697,35 @@ func TestSSHCommand_BuildScriptCommand(t *testing.T) {
 		)
 		assert.Equal(t, "env NAME='world' TOKEN='a'\"'\"'b' bash -s", command)
 		assert.Equal(t, script, payload)
+	})
+
+	// A value in the `env` prefix is visible in `ps` on the remote host, so
+	// secret-backed variables are exported over stdin instead. Literals stay
+	// in the prefix, keeping the command identical for nodes without secrets.
+	t.Run("secret values are exported over stdin while literals stay in the env prefix", func(t *testing.T) {
+		script := "echo \"$DB_PASSWORD\""
+		command, payload := c.buildScriptCommand(
+			"",
+			[]resolvedEnvVar{
+				{Name: "PUBLIC", Value: "prod"},
+				{Name: "DB_PASSWORD", Value: "a'b", Secret: true},
+			},
+			script,
+		)
+
+		assert.Equal(t, "env PUBLIC='prod' bash -s", command)
+		assert.Equal(t, "export DB_PASSWORD='a'\"'\"'b'\necho \"$DB_PASSWORD\"", payload)
+	})
+
+	t.Run("exports precede the working directory change", func(t *testing.T) {
+		command, payload := c.buildScriptCommand(
+			"/opt/app",
+			[]resolvedEnvVar{{Name: "TOKEN", Value: "t0k", Secret: true}},
+			"echo hi",
+		)
+
+		assert.Equal(t, "bash -s", command)
+		assert.Equal(t, "export TOKEN='t0k'\ncd '/opt/app' || exit 1\necho hi", payload)
 	})
 
 	t.Run("script with single quotes is streamed verbatim (no shell escaping needed)", func(t *testing.T) {
@@ -708,7 +769,7 @@ func TestSSHCommand_BuildExecutionCommand(t *testing.T) {
 			CommandSource: CommandSourceInline,
 			Commands:      "echo 1\necho 2",
 		}
-		command, stdin, err := c.buildExecutionCommand(meta, "")
+		command, stdin, err := c.buildExecutionCommand(meta, nil, "")
 		require.NoError(t, err)
 		assert.Equal(t, "bash -e -s", command)
 		require.NotNil(t, stdin)
@@ -718,13 +779,49 @@ func TestSSHCommand_BuildExecutionCommand(t *testing.T) {
 		assert.Equal(t, "echo 1\necho 2", string(body))
 	})
 
+	t.Run("inline single-line mode streams secrets over stdin", func(t *testing.T) {
+		meta := ExecutionMetadata{
+			CommandSource: CommandSourceInline,
+			Commands:      "docker run --rm app",
+		}
+
+		command, stdin, err := c.buildExecutionCommand(meta, []resolvedEnvVar{
+			{Name: "TOKEN", Value: "t0k", Secret: true},
+		}, "")
+
+		require.NoError(t, err)
+		assert.Equal(t, `sh -lc 'eval "$(cat)" && docker run --rm app'`, command)
+		require.NotNil(t, stdin)
+
+		body, readErr := io.ReadAll(stdin)
+		require.NoError(t, readErr)
+		assert.Equal(t, "export TOKEN='t0k'\n", string(body))
+	})
+
+	// Without secrets the single-line path must stay exactly as it was: no
+	// stdin payload and no `eval` wrapper.
+	t.Run("inline single-line mode with only literals leaves stdin unused", func(t *testing.T) {
+		meta := ExecutionMetadata{
+			CommandSource: CommandSourceInline,
+			Commands:      "echo hi",
+		}
+
+		command, stdin, err := c.buildExecutionCommand(meta, []resolvedEnvVar{
+			{Name: "PUBLIC", Value: "prod"},
+		}, "")
+
+		require.NoError(t, err)
+		assert.Equal(t, "env PUBLIC='prod' sh -lc 'echo hi'", command)
+		assert.Nil(t, stdin)
+	})
+
 	t.Run("inline mode keeps single-line commands on the command line", func(t *testing.T) {
 		meta := ExecutionMetadata{
 			CommandSource: CommandSourceInline,
 			Commands:      "echo 1 && echo 2",
 		}
 
-		command, stdin, err := c.buildExecutionCommand(meta, "")
+		command, stdin, err := c.buildExecutionCommand(meta, nil, "")
 		require.NoError(t, err)
 		assert.Equal(t, "echo 1 && echo 2", command)
 		assert.Nil(t, stdin)
@@ -744,7 +841,7 @@ func TestSSHCommand_BuildExecutionCommand(t *testing.T) {
 			Commands:      script,
 		}
 
-		command, stdin, err := c.buildExecutionCommand(meta, "")
+		command, stdin, err := c.buildExecutionCommand(meta, nil, "")
 		require.NoError(t, err)
 		assert.Equal(t, "bash -e -s", command)
 		require.NotNil(t, stdin)
@@ -767,7 +864,7 @@ func TestSSHCommand_BuildExecutionCommand(t *testing.T) {
 			Commands:      script,
 		}
 
-		command, stdin, err := c.buildExecutionCommand(meta, "")
+		command, stdin, err := c.buildExecutionCommand(meta, nil, "")
 		require.NoError(t, err)
 		assert.Equal(t, "bash -e -s", command)
 		require.NotNil(t, stdin)
@@ -783,7 +880,7 @@ func TestSSHCommand_BuildExecutionCommand(t *testing.T) {
 			Commands:      "false\necho should-not-run",
 		}
 
-		command, stdin, err := c.buildExecutionCommand(meta, "")
+		command, stdin, err := c.buildExecutionCommand(meta, nil, "")
 		require.NoError(t, err)
 		assert.Equal(t, "bash -e -s", command)
 		require.NotNil(t, stdin)
@@ -798,7 +895,7 @@ func TestSSHCommand_BuildExecutionCommand(t *testing.T) {
 			CommandSource: CommandSourceInline,
 			Commands:      "  \n  ",
 		}
-		_, _, err := c.buildExecutionCommand(meta, "")
+		_, _, err := c.buildExecutionCommand(meta, nil, "")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "commands is required")
 	})
@@ -810,7 +907,7 @@ func TestSSHCommand_BuildExecutionCommand(t *testing.T) {
 			CommandFile:   "scripts/deploy.sh",
 		}
 
-		command, stdin, err := c.buildExecutionCommand(meta, script)
+		command, stdin, err := c.buildExecutionCommand(meta, nil, script)
 		require.NoError(t, err)
 		assert.Equal(t, "bash -s", command)
 		require.NotNil(t, stdin)
@@ -828,7 +925,7 @@ func TestSSHCommand_BuildExecutionCommand(t *testing.T) {
 			CommandFile:   "scripts/deploy.sh",
 		}
 
-		command, stdin, err := c.buildExecutionCommand(meta, script)
+		command, stdin, err := c.buildExecutionCommand(meta, nil, script)
 		require.NoError(t, err)
 		assert.Equal(t, "bash -s", command)
 		require.NotNil(t, stdin)
@@ -845,12 +942,9 @@ func TestSSHCommand_BuildExecutionCommand(t *testing.T) {
 			CommandSource:    CommandSourceFile,
 			CommandFile:      "scripts/deploy.sh",
 			WorkingDirectory: "/opt/app",
-			Environment: []EnvironmentVariable{
-				{Name: "NAME", Value: "world"},
-			},
 		}
 
-		command, stdin, err := c.buildExecutionCommand(meta, script)
+		command, stdin, err := c.buildExecutionCommand(meta, []resolvedEnvVar{{Name: "NAME", Value: "world"}}, script)
 		require.NoError(t, err)
 		assert.Equal(t, "env NAME='world' bash -s", command)
 
@@ -864,7 +958,7 @@ func TestSSHCommand_BuildExecutionCommand(t *testing.T) {
 			CommandSource: CommandSourceFile,
 			CommandFile:   "scripts/deploy.sh",
 		}
-		_, _, err := c.buildExecutionCommand(meta, "")
+		_, _, err := c.buildExecutionCommand(meta, nil, "")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "command file body is required")
 	})
@@ -873,11 +967,44 @@ func TestSSHCommand_BuildExecutionCommand(t *testing.T) {
 		meta := ExecutionMetadata{
 			Commands: "echo legacy",
 		}
-		command, stdin, err := c.buildExecutionCommand(meta, "")
+		command, stdin, err := c.buildExecutionCommand(meta, nil, "")
 		require.NoError(t, err)
 		assert.Equal(t, "echo legacy", command)
 		assert.Nil(t, stdin)
 	})
+}
+
+// A retry rebuilds the command from metadata, which holds only the secret
+// reference. This proves the retry goes back to the secrets context instead of
+// reusing a value carried over from the first attempt.
+func TestSSHCommand_HandleHook_RetryResolvesSecretsAgain(t *testing.T) {
+	c := &SSHCommand{}
+	metadata := &testMetadataContext{
+		value: ExecutionMetadata{
+			Host:          "example.com",
+			Port:          22,
+			User:          "root",
+			Timeout:       60,
+			CommandSource: CommandSourceInline,
+			Commands:      "echo hi",
+			Environment: []EnvironmentVariable{{
+				Name:        "DB_PASSWORD",
+				ValueSource: EnvironmentValueSourceSecret,
+				Secret:      configuration.SecretKeyRef{Secret: "prod-db", Key: "absent"},
+			}},
+			Authentication: AuthSpec{Method: "invalid"},
+		},
+	}
+
+	err := c.HandleHook(core.ActionHookContext{
+		Name:           "executionRetry",
+		Metadata:       metadata,
+		Secrets:        &contexts.SecretsContext{Values: map[string][]byte{"prod-db/password": []byte("s3cret")}},
+		ExecutionState: &fakeExecutionState{},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "DB_PASSWORD")
 }
 
 // Regression for the metadata-leak fix: the retry hook must re-read the
@@ -998,4 +1125,384 @@ func TestSSHCommand_Setup_RejectsPaddedCommandSource(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid command source")
+}
+
+// Nodes saved before environment variables could reference secrets store only a
+// name and a value, so an unset value source must keep meaning "literal" or
+// every one of those variables would fail validation after this change.
+func TestEnvironmentVariable_ValueSourceOrDefault(t *testing.T) {
+	t.Run("defaults to literal when unset", func(t *testing.T) {
+		variable := EnvironmentVariable{Name: "ENVIRONMENT", Value: "production"}
+		assert.Equal(t, EnvironmentValueSourceLiteral, variable.valueSourceOrDefault())
+	})
+
+	t.Run("returns the configured source", func(t *testing.T) {
+		variable := EnvironmentVariable{Name: "DB_PASSWORD", ValueSource: EnvironmentValueSourceSecret}
+		assert.Equal(t, EnvironmentValueSourceSecret, variable.valueSourceOrDefault())
+	})
+
+	// A padded source must not be normalized: the console compares this value
+	// exactly when deciding which fields to show and keep, so accepting
+	// " secret " here would hide the secret reference in the UI and let it be
+	// filtered away on the next save. Returning it verbatim makes validation
+	// reject it loudly instead.
+	t.Run("returns a padded source verbatim so validation rejects it", func(t *testing.T) {
+		variable := EnvironmentVariable{Name: "DB_PASSWORD", ValueSource: " secret "}
+		assert.Equal(t, " secret ", variable.valueSourceOrDefault())
+
+		err := validateEnvironment([]EnvironmentVariable{variable})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "DB_PASSWORD")
+	})
+}
+
+func TestValidateEnvironment(t *testing.T) {
+	t.Run("accepts a literal variable without an explicit source", func(t *testing.T) {
+		err := validateEnvironment([]EnvironmentVariable{{Name: "ENVIRONMENT", Value: "production"}})
+		assert.NoError(t, err)
+	})
+
+	t.Run("accepts a secret variable with a complete reference", func(t *testing.T) {
+		err := validateEnvironment([]EnvironmentVariable{{
+			Name:        "DB_PASSWORD",
+			ValueSource: EnvironmentValueSourceSecret,
+			Secret:      configuration.SecretKeyRef{Secret: "prod-db", Key: "password"},
+		}})
+		assert.NoError(t, err)
+	})
+
+	t.Run("rejects an empty name", func(t *testing.T) {
+		err := validateEnvironment([]EnvironmentVariable{{Value: "production"}})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "environment variable name is required")
+	})
+
+	t.Run("rejects an invalid name", func(t *testing.T) {
+		err := validateEnvironment([]EnvironmentVariable{{Name: "1BAD", Value: "production"}})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid environment variable name: 1BAD")
+	})
+
+	t.Run("rejects a secret source without a reference", func(t *testing.T) {
+		err := validateEnvironment([]EnvironmentVariable{{
+			Name:        "DB_PASSWORD",
+			ValueSource: EnvironmentValueSourceSecret,
+			Secret:      configuration.SecretKeyRef{Secret: "prod-db"},
+		}})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "DB_PASSWORD")
+		assert.Contains(t, err.Error(), "secret name and key are required")
+	})
+
+	t.Run("rejects an unknown value source, naming the variable", func(t *testing.T) {
+		err := validateEnvironment([]EnvironmentVariable{{Name: "TOKEN", ValueSource: "vault"}})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "environment variable TOKEN")
+		assert.Contains(t, err.Error(), `invalid value source: "vault"`)
+	})
+
+	// Literals ride in the `env` prefix and secrets are exported over stdin, so
+	// with a duplicate name the secret wins no matter where it sits in the list.
+	// The order in the UI would stop matching what runs, so a duplicate is
+	// rejected outright — the same rule the runner component applies.
+	t.Run("rejects a duplicate name", func(t *testing.T) {
+		err := validateEnvironment([]EnvironmentVariable{
+			{Name: "TOKEN", Value: "literal"},
+			{
+				Name:        "TOKEN",
+				ValueSource: EnvironmentValueSourceSecret,
+				Secret:      configuration.SecretKeyRef{Secret: "vault", Key: "token"},
+			},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duplicate environment variable name: TOKEN")
+	})
+
+	// The console drops the value field when the source is secret, but a node
+	// published through the API keeps whatever it was sent. Rejecting the pair
+	// stops a plaintext credential from outliving the switch to a secret.
+	t.Run("rejects a secret variable that still carries a literal value", func(t *testing.T) {
+		err := validateEnvironment([]EnvironmentVariable{{
+			Name:        "DB_PASSWORD",
+			ValueSource: EnvironmentValueSourceSecret,
+			Secret:      configuration.SecretKeyRef{Secret: "prod-db", Key: "password"},
+			Value:       "leftover-plaintext",
+		}})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "DB_PASSWORD")
+		assert.Contains(t, err.Error(), "value must be empty")
+	})
+}
+
+func TestSSHCommand_Documentation_DescribesSecretEnvironmentVariables(t *testing.T) {
+	documentation := (&SSHCommand{}).Documentation()
+
+	assert.Contains(t, documentation, "key from an organization secret")
+	assert.Contains(t, documentation, "stdin")
+	assert.Contains(t, documentation, "Names must be unique")
+	// The transport keeps the value out of argument vectors, not out of the
+	// process environment. Saying so is what stops a reader from treating this
+	// as a stronger guarantee than it is.
+	assert.Contains(t, documentation, "environ")
+}
+
+func TestSSHCommand_Configuration_EnvironmentValueSource(t *testing.T) {
+	c := &SSHCommand{}
+	fields := c.Configuration()
+
+	environmentField := func() configuration.Field {
+		for _, field := range fields {
+			if field.Name == "environment" {
+				return field
+			}
+		}
+		t.Fatal("environment field not found")
+		return configuration.Field{}
+	}()
+
+	itemFields := environmentField.TypeOptions.List.ItemDefinition.Schema
+	byName := map[string]configuration.Field{}
+	for _, field := range itemFields {
+		byName[field.Name] = field
+	}
+
+	t.Run("offers a literal and a secret source", func(t *testing.T) {
+		valueSource, ok := byName["valueSource"]
+		require.True(t, ok, "valueSource field is missing")
+		require.NotNil(t, valueSource.TypeOptions)
+		require.NotNil(t, valueSource.TypeOptions.Select)
+		assert.Equal(t, []configuration.FieldOption{
+			{Label: "Literal value", Value: EnvironmentValueSourceLiteral},
+			{Label: "Secret key", Value: EnvironmentValueSourceSecret},
+		}, valueSource.TypeOptions.Select.Options)
+	})
+
+	// Nodes saved before this field existed omit it, and ValidateConfiguration
+	// does not apply Field.Default — marking it required would fail every one
+	// of those nodes on the next publish.
+	t.Run("value source stays optional at the schema level", func(t *testing.T) {
+		assert.False(t, byName["valueSource"].Required)
+	})
+
+	// The empty value matters: the console filters out invisible fields and
+	// persists the result, and it does not apply Field.Default inside list
+	// items. Without "" in the condition, opening the settings of a node saved
+	// before this change would drop every literal value it has.
+	t.Run("value stays visible when the source is unset", func(t *testing.T) {
+		value := byName["value"]
+		assert.False(t, value.Required)
+		assert.Equal(t, []configuration.VisibilityCondition{
+			{Field: "valueSource", Values: []string{EnvironmentValueSourceLiteral, ""}},
+		}, value.VisibilityConditions)
+
+		secret, ok := byName["secret"]
+		require.True(t, ok, "secret field is missing")
+		assert.Equal(t, configuration.FieldTypeSecretKey, secret.Type)
+		assert.Equal(t, []configuration.RequiredCondition{
+			{Field: "valueSource", Values: []string{EnvironmentValueSourceSecret}},
+		}, secret.RequiredConditions)
+	})
+
+	t.Run("accepts a legacy variable that predates the value source", func(t *testing.T) {
+		err := configuration.ValidateConfiguration(fields, map[string]any{
+			"host":     "example.com",
+			"port":     22,
+			"username": "root",
+			"authentication": map[string]any{
+				"authMethod": AuthMethodPassword,
+				"password":   map[string]any{"secret": "my-secret", "key": "password"},
+			},
+			"commands":    "echo hi",
+			"timeout":     60,
+			"environment": []any{map[string]any{"name": "ENVIRONMENT", "value": "production"}},
+		})
+		require.NoError(t, err)
+	})
+
+	// Explains why the empty string belongs in the visibility condition but not
+	// in the required condition. A legacy variable omits valueSource entirely,
+	// and isRequiredByCondition skips a condition whose field is absent. An
+	// explicitly empty source never reaches that logic at all — the select
+	// validation rejects it first — so listing "" as a required condition would
+	// only ever be dead weight.
+	t.Run("an explicitly empty value source is rejected as an unknown option", func(t *testing.T) {
+		assert.Equal(t, []configuration.RequiredCondition{
+			{Field: "valueSource", Values: []string{EnvironmentValueSourceLiteral}},
+		}, byName["value"].RequiredConditions)
+
+		err := configuration.ValidateConfiguration(fields, map[string]any{
+			"host":     "example.com",
+			"port":     22,
+			"username": "root",
+			"authentication": map[string]any{
+				"authMethod": AuthMethodPassword,
+				"password":   map[string]any{"secret": "my-secret", "key": "password"},
+			},
+			"commands":    "echo hi",
+			"timeout":     60,
+			"environment": []any{map[string]any{"name": "ENVIRONMENT", "valueSource": ""}},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must be one of: literal, secret")
+	})
+
+	t.Run("accepts a secret-backed variable", func(t *testing.T) {
+		err := configuration.ValidateConfiguration(fields, map[string]any{
+			"host":     "example.com",
+			"port":     22,
+			"username": "root",
+			"authentication": map[string]any{
+				"authMethod": AuthMethodPassword,
+				"password":   map[string]any{"secret": "my-secret", "key": "password"},
+			},
+			"commands": "echo hi",
+			"timeout":  60,
+			"environment": []any{map[string]any{
+				"name":        "DB_PASSWORD",
+				"valueSource": EnvironmentValueSourceSecret,
+				"secret":      map[string]any{"secret": "prod-db", "key": "password"},
+			}},
+		})
+		require.NoError(t, err)
+	})
+}
+
+func TestResolveEnvironment(t *testing.T) {
+	secrets := &contexts.SecretsContext{
+		Values: map[string][]byte{"prod-db/password": []byte("s3cret")},
+	}
+
+	t.Run("passes a literal through untouched", func(t *testing.T) {
+		resolved, err := resolveEnvironment(secrets, []EnvironmentVariable{
+			{Name: "ENVIRONMENT", Value: "production"},
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, []resolvedEnvVar{{Name: "ENVIRONMENT", Value: "production"}}, resolved)
+	})
+
+	t.Run("reads a secret-backed value and marks it secret", func(t *testing.T) {
+		resolved, err := resolveEnvironment(secrets, []EnvironmentVariable{{
+			Name:        "DB_PASSWORD",
+			ValueSource: EnvironmentValueSourceSecret,
+			Secret:      configuration.SecretKeyRef{Secret: "prod-db", Key: "password"},
+		}})
+
+		require.NoError(t, err)
+		assert.Equal(t, []resolvedEnvVar{{Name: "DB_PASSWORD", Value: "s3cret", Secret: true}}, resolved)
+	})
+
+	// A variable name is interpolated into `export NAME=...` and `env NAME=...`
+	// without quoting — it cannot be quoted and stay an assignment. Resolution
+	// runs on the retry path, which rebuilds the command from metadata, so the
+	// name has to be checked here and not only where the node is published.
+	t.Run("rejects a name that would break out of the assignment", func(t *testing.T) {
+		_, err := resolveEnvironment(secrets, []EnvironmentVariable{
+			{Name: "TOKEN; curl evil.example.com", Value: "x"},
+		})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid environment variable name")
+	})
+
+	t.Run("reports a missing secrets context instead of panicking", func(t *testing.T) {
+		_, err := resolveEnvironment(nil, []EnvironmentVariable{{
+			Name:        "DB_PASSWORD",
+			ValueSource: EnvironmentValueSourceSecret,
+			Secret:      configuration.SecretKeyRef{Secret: "prod-db", Key: "password"},
+		}})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "DB_PASSWORD")
+		assert.Contains(t, err.Error(), "secrets are not available")
+	})
+
+	t.Run("fails naming the variable when the secret is missing", func(t *testing.T) {
+		_, err := resolveEnvironment(secrets, []EnvironmentVariable{{
+			Name:        "DB_PASSWORD",
+			ValueSource: EnvironmentValueSourceSecret,
+			Secret:      configuration.SecretKeyRef{Secret: "prod-db", Key: "absent"},
+		}})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "DB_PASSWORD")
+	})
+}
+
+// Guard test: metadata is persisted to the database and shown in the run
+// inspector, so a resolved secret value must never reach it. The variable is
+// stored as a reference and resolved again on every attempt.
+func TestSSHCommand_Execute_KeepsSecretValuesOutOfMetadata(t *testing.T) {
+	c := &SSHCommand{}
+	metadata := &testMetadataContext{}
+
+	err := c.Execute(core.ExecutionContext{
+		Configuration: map[string]any{
+			"host":     "example.com",
+			"port":     22,
+			"username": "root",
+			"timeout":  60,
+			"commands": "echo hi",
+			// An unsupported method aborts the run after metadata is written
+			// but before any connection is attempted.
+			"authentication": map[string]any{"authMethod": "invalid"},
+			"environment": []any{
+				map[string]any{
+					"name":        "DB_PASSWORD",
+					"valueSource": "secret",
+					"secret":      map[string]any{"secret": "prod-db", "key": "password"},
+				},
+			},
+		},
+		Metadata: metadata,
+		Secrets:  &contexts.SecretsContext{Values: map[string][]byte{"prod-db/password": []byte("s3cret")}},
+	})
+
+	require.Error(t, err)
+	saved, ok := metadata.Get().(ExecutionMetadata)
+	require.True(t, ok)
+	require.Len(t, saved.Environment, 1)
+	assert.Equal(t, configuration.SecretKeyRef{Secret: "prod-db", Key: "password"}, saved.Environment[0].Secret)
+	// Empty rather than resolved: a future change that copies a value into the
+	// stored variable would fail here.
+	assert.Empty(t, saved.Environment[0].Value)
+	assert.NotContains(t, fmt.Sprintf("%v", metadata.Get()), "s3cret")
+}
+
+func TestSSHCommand_Setup_RejectsSecretEnvironmentWithoutReference(t *testing.T) {
+	c := &SSHCommand{}
+
+	err := c.Setup(core.SetupContext{
+		Configuration: map[string]any{
+			"host":           "example.com",
+			"username":       "root",
+			"authentication": authConfig(AuthMethodSSHKey, map[string]any{"secret": "my-secret", "key": "private_key"}, nil),
+			"commands":       "echo hi",
+			"timeout":        60,
+			"environment": []any{
+				map[string]any{"name": "DB_PASSWORD", "valueSource": "secret"},
+			},
+		},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "secret name and key are required")
+}
+
+func TestSSHCommand_DecodeSpec_EnvironmentSecretSource(t *testing.T) {
+	spec := Spec{}
+	err := mapstructure.Decode(map[string]any{
+		"environment": []any{
+			map[string]any{
+				"name":        "DB_PASSWORD",
+				"valueSource": "secret",
+				"secret":      map[string]any{"secret": "prod-db", "key": "password"},
+			},
+		},
+	}, &spec)
+
+	require.NoError(t, err)
+	require.Len(t, spec.Environment, 1)
+	assert.Equal(t, EnvironmentValueSourceSecret, spec.Environment[0].ValueSource)
+	assert.Equal(t, configuration.SecretKeyRef{Secret: "prod-db", Key: "password"}, spec.Environment[0].Secret)
 }
