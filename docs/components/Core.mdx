@@ -1388,7 +1388,7 @@ Choose **SSH key** or **Password**, then select the organization Secret and the 
 - **Commands** (inline mode): One or more commands to run, one per line (supports expressions). Each non-empty line becomes a command joined with &&. The output payload is based on the last command.
 - **Command file** (file mode): Path to a file in the app's repository (e.g. `scripts/deploy.sh`).
 - **Working directory**: Optional; Changes to this directory before running the command.
-- **Environment variables**: Optional list of key/value pairs available during command execution.
+- **Environment variables**: Optional list of variables available during command execution. Names must be unique. Each variable takes either a literal value or a key from an organization secret. A secret-backed value is read when the command runs and is streamed over stdin rather than placed on the command line, so it never becomes part of any argument vector on the remote host — it stays out of `ps` output and out of the execve records that audit tooling collects. It is still an ordinary environment variable once the command starts, so anything able to read `/proc/<pid>/environ` for that process can see it. Note that a single-line command runs under `sh -lc` as soon as any variable is set, so bash-only syntax needs a multi-line command or a command file.
 - **Timeout (seconds)**: How long the command may run (default 60).
 - **Connection retry** (optional): Enable to retry connecting when the host is not reachable yet (e.g. server still booting). Set number of retries and interval between attempts.
 - **Execution retry** (optional): Enable to retry running the command when the exit status is not 0. Set number of retries and interval between attempts.

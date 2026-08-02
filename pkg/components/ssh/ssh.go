@@ -67,10 +67,12 @@ type ExecutionRetrySpec = RetrySpec
 // stored secret; the value of a secret-backed variable is resolved at execution
 // time and never persisted.
 type EnvironmentVariable struct {
-	Name        string                     `json:"name" mapstructure:"name"`
-	ValueSource string                     `json:"valueSource,omitempty" mapstructure:"valueSource"`
-	Value       string                     `json:"value,omitempty" mapstructure:"value"`
-	Secret      configuration.SecretKeyRef `json:"secret,omitempty" mapstructure:"secret"`
+	Name        string `json:"name" mapstructure:"name"`
+	ValueSource string `json:"valueSource,omitempty" mapstructure:"valueSource"`
+	Value       string `json:"value,omitempty" mapstructure:"value"`
+	// No omitempty: encoding/json never treats a struct as empty, so the tag
+	// would promise a behaviour that does not exist.
+	Secret configuration.SecretKeyRef `json:"secret" mapstructure:"secret"`
 }
 
 // valueSourceOrDefault treats an unset value source as literal so variables
@@ -104,31 +106,32 @@ type resolvedEnvVar struct {
 // It runs on every attempt rather than once at setup, so retries pick up a
 // rotated secret and no resolved value is ever written to execution metadata.
 func resolveEnvironment(secrets core.SecretsContext, environment []EnvironmentVariable) ([]resolvedEnvVar, error) {
+	// Retries rebuild the command from metadata without going through Setup, so
+	// this is the only point every attempt passes through. That makes it the
+	// place to check the variable name too, which is interpolated into
+	// `env NAME=` and `export NAME=` and cannot be quoted there.
+	if err := validateEnvironment(environment); err != nil {
+		return nil, err
+	}
+
 	resolved := make([]resolvedEnvVar, 0, len(environment))
 
 	for _, variable := range environment {
-		// Retries rebuild the command straight from metadata without running
-		// validateEnvironment, so an unknown source must fail here rather than
-		// quietly turn into an empty literal.
-		switch variable.valueSourceOrDefault() {
-		case EnvironmentValueSourceLiteral:
+		if variable.valueSourceOrDefault() == EnvironmentValueSourceLiteral {
 			resolved = append(resolved, resolvedEnvVar{Name: variable.Name, Value: variable.Value})
-
-		case EnvironmentValueSourceSecret:
-			if secrets == nil {
-				return nil, fmt.Errorf("environment variable %s: secrets are not available", variable.Name)
-			}
-
-			value, err := secrets.GetKey(variable.Secret.Secret, variable.Secret.Key)
-			if err != nil {
-				return nil, fmt.Errorf("environment variable %s: %w", variable.Name, err)
-			}
-
-			resolved = append(resolved, resolvedEnvVar{Name: variable.Name, Value: string(value), Secret: true})
-
-		default:
-			return nil, fmt.Errorf("environment variable %s: invalid value source: %q", variable.Name, variable.ValueSource)
+			continue
 		}
+
+		if secrets == nil {
+			return nil, fmt.Errorf("environment variable %s: secrets are not available", variable.Name)
+		}
+
+		value, err := secrets.GetKey(variable.Secret.Secret, variable.Secret.Key)
+		if err != nil {
+			return nil, fmt.Errorf("environment variable %s: %w", variable.Name, err)
+		}
+
+		resolved = append(resolved, resolvedEnvVar{Name: variable.Name, Value: string(value), Secret: true})
 	}
 
 	return resolved, nil
@@ -138,6 +141,8 @@ func resolveEnvironment(secrets core.SecretsContext, environment []EnvironmentVa
 // node that was valid when saved cannot reach the remote host with an
 // environment the worker cannot resolve.
 func validateEnvironment(environment []EnvironmentVariable) error {
+	seen := make(map[string]struct{}, len(environment))
+
 	for _, variable := range environment {
 		if variable.Name == "" {
 			return errors.New("environment variable name is required")
@@ -146,12 +151,26 @@ func validateEnvironment(environment []EnvironmentVariable) error {
 			return fmt.Errorf("invalid environment variable name: %s", variable.Name)
 		}
 
+		// Literals ride in the `env` prefix and secrets are exported over stdin,
+		// so on a duplicate the secret wins wherever it sits in the list and the
+		// order shown in the UI stops describing what runs.
+		if _, duplicate := seen[variable.Name]; duplicate {
+			return fmt.Errorf("duplicate environment variable name: %s", variable.Name)
+		}
+		seen[variable.Name] = struct{}{}
+
 		switch variable.valueSourceOrDefault() {
 		case EnvironmentValueSourceLiteral:
 			// A literal carries its value inline; nothing else to check.
 		case EnvironmentValueSourceSecret:
 			if !variable.Secret.IsSet() {
 				return fmt.Errorf("environment variable %s: secret name and key are required", variable.Name)
+			}
+			// The console strips the value once the source is secret, but a node
+			// published through the API keeps whatever it was sent. Rejecting
+			// the pair keeps a plaintext credential from outliving the switch.
+			if variable.Value != "" {
+				return fmt.Errorf("environment variable %s: value must be empty when the value source is a secret", variable.Name)
 			}
 		default:
 			return fmt.Errorf("environment variable %s: invalid value source: %q", variable.Name, variable.ValueSource)
@@ -241,7 +260,7 @@ Choose **SSH key** or **Password**, then select the organization Secret and the 
 - **Commands** (inline mode): One or more commands to run, one per line (supports expressions). Each non-empty line becomes a command joined with &&. The output payload is based on the last command.
 - **Command file** (file mode): Path to a file in the app's repository (e.g. ` + "`scripts/deploy.sh`" + `).
 - **Working directory**: Optional; Changes to this directory before running the command.
-- **Environment variables**: Optional list of variables available during command execution. Each variable takes either a literal value or a key from an organization secret. A secret-backed value is read when the command runs and is sent over stdin rather than on the command line, so it does not appear in the process list on the remote host. Note that a single-line command runs under ` + "`sh -lc`" + ` as soon as any variable is set, so bash-only syntax needs a multi-line command or a command file.
+- **Environment variables**: Optional list of variables available during command execution. Names must be unique. Each variable takes either a literal value or a key from an organization secret. A secret-backed value is read when the command runs and is streamed over stdin rather than placed on the command line, so it never becomes part of any argument vector on the remote host — it stays out of ` + "`ps`" + ` output and out of the execve records that audit tooling collects. It is still an ordinary environment variable once the command starts, so anything able to read ` + "`/proc/<pid>/environ`" + ` for that process can see it. Note that a single-line command runs under ` + "`sh -lc`" + ` as soon as any variable is set, so bash-only syntax needs a multi-line command or a command file.
 - **Timeout (seconds)**: How long the command may run (default 60).
 - **Connection retry** (optional): Enable to retry connecting when the host is not reachable yet (e.g. server still booting). Set number of retries and interval between attempts.
 - **Execution retry** (optional): Enable to retry running the command when the exit status is not 0. Set number of retries and interval between attempts.
@@ -989,8 +1008,10 @@ func (c *SSHCommand) buildRemoteCommand(workingDirectory string, environment []r
 		return finalCommand, ""
 	}
 
+	// `&&` rather than `;` so a failed sourcing stops the run instead of letting
+	// the command loose against a production host with the variables unset.
 	if exports != "" {
-		finalCommand = `eval "$(cat)"; ` + finalCommand
+		finalCommand = `eval "$(cat)" && ` + finalCommand
 	}
 
 	remoteCommand := fmt.Sprintf("sh -lc %s", shellQuote(finalCommand))
