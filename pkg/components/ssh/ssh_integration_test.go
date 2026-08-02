@@ -3,6 +3,8 @@ package ssh
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
+	"maps"
 	"net"
 	"os/exec"
 	"strings"
@@ -116,7 +118,7 @@ func serveTestSSHSession(channel ssh.Channel, requests <-chan *ssh.Request) {
 		exitCode := 0
 		if err := command.Run(); err != nil {
 			var exitError *exec.ExitError
-			if ok := asExitError(err, &exitError); ok {
+			if errors.As(err, &exitError) {
 				exitCode = exitError.ExitCode()
 			} else {
 				exitCode = 1
@@ -126,14 +128,6 @@ func serveTestSSHSession(channel ssh.Channel, requests <-chan *ssh.Request) {
 		_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(exitCode)}))
 		return
 	}
-}
-
-func asExitError(err error, target **exec.ExitError) bool {
-	exitError, ok := err.(*exec.ExitError)
-	if ok {
-		*target = exitError
-	}
-	return ok
 }
 
 // capturingExecutionState records what the component emits so a test can
@@ -167,8 +161,13 @@ func (s *capturingExecutionState) result(t *testing.T) *CommandResult {
 
 // runComponentAgainstTestServer executes the component against the in-process
 // server and returns the command result it produced.
-func runComponentAgainstTestServer(t *testing.T, host string, port int, configuration map[string]any, secrets map[string][]byte) *CommandResult {
+func runComponentAgainstTestServer(t *testing.T, host string, port int, nodeConfiguration map[string]any, secrets map[string][]byte) *CommandResult {
 	t.Helper()
+
+	// Copied rather than mutated in place: the caller's literal stays readable
+	// as the exact configuration under test.
+	configuration := map[string]any{"timeout": 30}
+	maps.Copy(configuration, nodeConfiguration)
 
 	configuration["host"] = host
 	configuration["port"] = port
@@ -176,9 +175,6 @@ func runComponentAgainstTestServer(t *testing.T, host string, port int, configur
 	configuration["authentication"] = map[string]any{
 		"authMethod": AuthMethodPassword,
 		"password":   map[string]any{"secret": "host", "key": "password"},
-	}
-	if _, ok := configuration["timeout"]; !ok {
-		configuration["timeout"] = 30
 	}
 
 	secretValues := map[string][]byte{"host/password": []byte("irrelevant")}
