@@ -974,10 +974,6 @@ func TestSSHCommand_BuildExecutionCommand(t *testing.T) {
 	})
 }
 
-// Regression for the metadata-leak fix: the retry hook must re-read the
-// command file from the canvas repository on every retry, surface file
-// errors before any SSH work, and never fall back to script content from
-// stored metadata.
 // A retry rebuilds the command from metadata, which holds only the secret
 // reference. This proves the retry goes back to the secrets context instead of
 // reusing a value carried over from the first attempt.
@@ -1011,6 +1007,10 @@ func TestSSHCommand_HandleHook_RetryResolvesSecretsAgain(t *testing.T) {
 	assert.Contains(t, err.Error(), "DB_PASSWORD")
 }
 
+// Regression for the metadata-leak fix: the retry hook must re-read the
+// command file from the canvas repository on every retry, surface file
+// errors before any SSH work, and never fall back to script content from
+// stored metadata.
 func TestSSHCommand_HandleHook_FileModeRetryRereadsFile(t *testing.T) {
 	c := &SSHCommand{}
 	files := &fakeFilesContext{
