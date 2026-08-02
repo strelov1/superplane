@@ -978,6 +978,39 @@ func TestSSHCommand_BuildExecutionCommand(t *testing.T) {
 // command file from the canvas repository on every retry, surface file
 // errors before any SSH work, and never fall back to script content from
 // stored metadata.
+// A retry rebuilds the command from metadata, which holds only the secret
+// reference. This proves the retry goes back to the secrets context instead of
+// reusing a value carried over from the first attempt.
+func TestSSHCommand_HandleHook_RetryResolvesSecretsAgain(t *testing.T) {
+	c := &SSHCommand{}
+	metadata := &testMetadataContext{
+		value: ExecutionMetadata{
+			Host:          "example.com",
+			Port:          22,
+			User:          "root",
+			Timeout:       60,
+			CommandSource: CommandSourceInline,
+			Commands:      "echo hi",
+			Environment: []EnvironmentVariable{{
+				Name:        "DB_PASSWORD",
+				ValueSource: EnvironmentValueSourceSecret,
+				Secret:      configuration.SecretKeyRef{Secret: "prod-db", Key: "absent"},
+			}},
+			Authentication: AuthSpec{Method: "invalid"},
+		},
+	}
+
+	err := c.HandleHook(core.ActionHookContext{
+		Name:           "executionRetry",
+		Metadata:       metadata,
+		Secrets:        &contexts.SecretsContext{Values: map[string][]byte{"prod-db/password": []byte("s3cret")}},
+		ExecutionState: &fakeExecutionState{},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "DB_PASSWORD")
+}
+
 func TestSSHCommand_HandleHook_FileModeRetryRereadsFile(t *testing.T) {
 	c := &SSHCommand{}
 	files := &fakeFilesContext{
@@ -1107,6 +1140,20 @@ func TestEnvironmentVariable_ValueSourceOrDefault(t *testing.T) {
 		variable := EnvironmentVariable{Name: "DB_PASSWORD", ValueSource: EnvironmentValueSourceSecret}
 		assert.Equal(t, EnvironmentValueSourceSecret, variable.valueSourceOrDefault())
 	})
+
+	// A padded source must not be normalized: the console compares this value
+	// exactly when deciding which fields to show and keep, so accepting
+	// " secret " here would hide the secret reference in the UI and let it be
+	// filtered away on the next save. Returning it verbatim makes validation
+	// reject it loudly instead.
+	t.Run("returns a padded source verbatim so validation rejects it", func(t *testing.T) {
+		variable := EnvironmentVariable{Name: "DB_PASSWORD", ValueSource: " secret "}
+		assert.Equal(t, " secret ", variable.valueSourceOrDefault())
+
+		err := validateEnvironment([]EnvironmentVariable{variable})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "DB_PASSWORD")
+	})
 }
 
 func TestValidateEnvironment(t *testing.T) {
@@ -1147,17 +1194,18 @@ func TestValidateEnvironment(t *testing.T) {
 		assert.Contains(t, err.Error(), "secret name and key are required")
 	})
 
-	t.Run("rejects an unknown value source", func(t *testing.T) {
+	t.Run("rejects an unknown value source, naming the variable", func(t *testing.T) {
 		err := validateEnvironment([]EnvironmentVariable{{Name: "TOKEN", ValueSource: "vault"}})
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "invalid environment variable value source: vault")
+		assert.Contains(t, err.Error(), "environment variable TOKEN")
+		assert.Contains(t, err.Error(), `invalid value source: "vault"`)
 	})
 }
 
 func TestSSHCommand_Documentation_DescribesSecretEnvironmentVariables(t *testing.T) {
 	documentation := (&SSHCommand{}).Documentation()
 
-	assert.Contains(t, documentation, "secret")
+	assert.Contains(t, documentation, "key from an organization secret")
 	assert.Contains(t, documentation, "stdin")
 }
 
@@ -1199,11 +1247,15 @@ func TestSSHCommand_Configuration_EnvironmentValueSource(t *testing.T) {
 		assert.False(t, byName["valueSource"].Required)
 	})
 
-	t.Run("value and secret are gated on the selected source", func(t *testing.T) {
+	// The empty value matters: the console filters out invisible fields and
+	// persists the result, and it does not apply Field.Default inside list
+	// items. Without "" in the condition, opening the settings of a node saved
+	// before this change would drop every literal value it has.
+	t.Run("value stays visible when the source is unset", func(t *testing.T) {
 		value := byName["value"]
 		assert.False(t, value.Required)
 		assert.Equal(t, []configuration.VisibilityCondition{
-			{Field: "valueSource", Values: []string{EnvironmentValueSourceLiteral}},
+			{Field: "valueSource", Values: []string{EnvironmentValueSourceLiteral, ""}},
 		}, value.VisibilityConditions)
 
 		secret, ok := byName["secret"]
@@ -1322,6 +1374,9 @@ func TestSSHCommand_Execute_KeepsSecretValuesOutOfMetadata(t *testing.T) {
 	require.True(t, ok)
 	require.Len(t, saved.Environment, 1)
 	assert.Equal(t, configuration.SecretKeyRef{Secret: "prod-db", Key: "password"}, saved.Environment[0].Secret)
+	// Empty rather than resolved: a future change that copies a value into the
+	// stored variable would fail here.
+	assert.Empty(t, saved.Environment[0].Value)
 	assert.NotContains(t, fmt.Sprintf("%v", metadata.Get()), "s3cret")
 }
 

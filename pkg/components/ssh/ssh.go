@@ -75,15 +75,19 @@ type EnvironmentVariable struct {
 
 // valueSourceOrDefault treats an unset value source as literal so variables
 // saved before secret sourcing existed keep working without a data migration.
-// A padded value is trimmed here, unlike commandSourceOrDefault: no UI
-// visibility condition reads this field, so there is no cross-side agreement
-// that a verbatim value would protect.
+//
+// Like commandSourceOrDefault, a non-empty value is returned verbatim and must
+// match a known source exactly. The console evaluates the value/secret
+// visibility conditions with an exact comparison, so a padded value such as
+// " secret " would hide the secret reference there — and be dropped on the next
+// save — while a trimmed value here would still run as a secret on the worker.
+// Returning it verbatim keeps both sides in agreement and makes a padded value
+// fail loudly as an invalid value source.
 func (v EnvironmentVariable) valueSourceOrDefault() string {
-	source := strings.TrimSpace(v.ValueSource)
-	if source == "" {
+	if strings.TrimSpace(v.ValueSource) == "" {
 		return EnvironmentValueSourceLiteral
 	}
-	return source
+	return v.ValueSource
 }
 
 // resolvedEnvVar is an environment variable with its value already in hand.
@@ -103,21 +107,28 @@ func resolveEnvironment(secrets core.SecretsContext, environment []EnvironmentVa
 	resolved := make([]resolvedEnvVar, 0, len(environment))
 
 	for _, variable := range environment {
-		if variable.valueSourceOrDefault() != EnvironmentValueSourceSecret {
+		// Retries rebuild the command straight from metadata without running
+		// validateEnvironment, so an unknown source must fail here rather than
+		// quietly turn into an empty literal.
+		switch variable.valueSourceOrDefault() {
+		case EnvironmentValueSourceLiteral:
 			resolved = append(resolved, resolvedEnvVar{Name: variable.Name, Value: variable.Value})
-			continue
-		}
 
-		if secrets == nil {
-			return nil, fmt.Errorf("environment variable %s: secrets are not available", variable.Name)
-		}
+		case EnvironmentValueSourceSecret:
+			if secrets == nil {
+				return nil, fmt.Errorf("environment variable %s: secrets are not available", variable.Name)
+			}
 
-		value, err := secrets.GetKey(variable.Secret.Secret, variable.Secret.Key)
-		if err != nil {
-			return nil, fmt.Errorf("environment variable %s: %w", variable.Name, err)
-		}
+			value, err := secrets.GetKey(variable.Secret.Secret, variable.Secret.Key)
+			if err != nil {
+				return nil, fmt.Errorf("environment variable %s: %w", variable.Name, err)
+			}
 
-		resolved = append(resolved, resolvedEnvVar{Name: variable.Name, Value: string(value), Secret: true})
+			resolved = append(resolved, resolvedEnvVar{Name: variable.Name, Value: string(value), Secret: true})
+
+		default:
+			return nil, fmt.Errorf("environment variable %s: invalid value source: %q", variable.Name, variable.ValueSource)
+		}
 	}
 
 	return resolved, nil
@@ -143,7 +154,7 @@ func validateEnvironment(environment []EnvironmentVariable) error {
 				return fmt.Errorf("environment variable %s: secret name and key are required", variable.Name)
 			}
 		default:
-			return fmt.Errorf("invalid environment variable value source: %s", variable.ValueSource)
+			return fmt.Errorf("environment variable %s: invalid value source: %q", variable.Name, variable.ValueSource)
 		}
 	}
 
@@ -230,7 +241,7 @@ Choose **SSH key** or **Password**, then select the organization Secret and the 
 - **Commands** (inline mode): One or more commands to run, one per line (supports expressions). Each non-empty line becomes a command joined with &&. The output payload is based on the last command.
 - **Command file** (file mode): Path to a file in the app's repository (e.g. ` + "`scripts/deploy.sh`" + `).
 - **Working directory**: Optional; Changes to this directory before running the command.
-- **Environment variables**: Optional list of variables available during command execution. Each variable takes either a literal value or a key from an organization secret. A secret-backed value is read when the command runs and is sent over stdin rather than on the command line, so it does not appear in the process list on the remote host.
+- **Environment variables**: Optional list of variables available during command execution. Each variable takes either a literal value or a key from an organization secret. A secret-backed value is read when the command runs and is sent over stdin rather than on the command line, so it does not appear in the process list on the remote host. Note that a single-line command runs under ` + "`sh -lc`" + ` as soon as any variable is set, so bash-only syntax needs a multi-line command or a command file.
 - **Timeout (seconds)**: How long the command may run (default 60).
 - **Connection retry** (optional): Enable to retry connecting when the host is not reachable yet (e.g. server still booting). Set number of retries and interval between attempts.
 - **Execution retry** (optional): Enable to retry running the command when the exit status is not 0. Set number of retries and interval between attempts.
@@ -430,13 +441,19 @@ func (c *SSHCommand) Configuration() []configuration.Field {
 								},
 							},
 							{
-								Name:                 "value",
-								Label:                "Value",
-								Type:                 configuration.FieldTypeString,
-								Description:          "Environment variable value",
-								Placeholder:          "e.g. production",
-								Required:             false,
-								VisibilityConditions: []configuration.VisibilityCondition{{Field: "valueSource", Values: []string{EnvironmentValueSourceLiteral}}},
+								Name:        "value",
+								Label:       "Value",
+								Type:        configuration.FieldTypeString,
+								Description: "Environment variable value",
+								Placeholder: "e.g. production",
+								Required:    false,
+								// An unset source counts as literal here, matching
+								// valueSourceOrDefault. The console filters out
+								// invisible fields and persists the result without
+								// applying Default inside list items, so omitting
+								// "" would drop the value of every variable saved
+								// before this field existed.
+								VisibilityConditions: []configuration.VisibilityCondition{{Field: "valueSource", Values: []string{EnvironmentValueSourceLiteral, ""}}},
 								RequiredConditions:   []configuration.RequiredCondition{{Field: "valueSource", Values: []string{EnvironmentValueSourceLiteral}}},
 							},
 							{
@@ -778,18 +795,20 @@ type ExecuteSSHContext struct {
 }
 
 func (c *SSHCommand) executeSSH(ctx ExecuteSSHContext) error {
+	// Resolved on every attempt, including retries, so no secret value is kept
+	// between attempts and a rotated secret is picked up. Done before the
+	// client is built so an unresolvable variable fails without first parsing
+	// the connection credentials.
+	environment, err := resolveEnvironment(ctx.secretsCtx, ctx.execMetadata.Environment)
+	if err != nil {
+		return err
+	}
+
 	client, err := c.createClient(ctx.secretsCtx, ctx.execMetadata)
 	if err != nil {
 		return err
 	}
 	defer client.Close()
-
-	// Resolved on every attempt, including retries, so no secret value is kept
-	// between attempts and a rotated secret is picked up.
-	environment, err := resolveEnvironment(ctx.secretsCtx, ctx.execMetadata.Environment)
-	if err != nil {
-		return err
-	}
 
 	command, stdin, err := c.buildExecutionCommand(ctx.execMetadata, environment, ctx.scriptBody)
 	if err != nil {
