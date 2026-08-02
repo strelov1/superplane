@@ -27,6 +27,13 @@ const (
 	CommandSourceFile   = "file"
 )
 
+// Where an environment variable's value comes from. The wording matches the
+// runner component so both present the same choice in the UI.
+const (
+	EnvironmentValueSourceLiteral = "literal"
+	EnvironmentValueSourceSecret  = "secret"
+)
+
 // Cap the size of a command file we are willing to load over SSH so that a
 // runaway script cannot blow up worker memory or push past shell argv limits.
 const maxCommandFileSize = 256 * 1024
@@ -55,9 +62,92 @@ type RetrySpec struct {
 type ConnectionRetrySpec = RetrySpec
 type ExecutionRetrySpec = RetrySpec
 
+// EnvironmentVariable is one row in the SSH component's "Environment variables"
+// list. A variable either carries a literal value or points at a key in a
+// stored secret; the value of a secret-backed variable is resolved at execution
+// time and never persisted.
 type EnvironmentVariable struct {
-	Name  string `json:"name" mapstructure:"name"`
-	Value string `json:"value" mapstructure:"value"`
+	Name        string                     `json:"name" mapstructure:"name"`
+	ValueSource string                     `json:"valueSource,omitempty" mapstructure:"valueSource"`
+	Value       string                     `json:"value,omitempty" mapstructure:"value"`
+	Secret      configuration.SecretKeyRef `json:"secret,omitempty" mapstructure:"secret"`
+}
+
+// valueSourceOrDefault treats an unset value source as literal so variables
+// saved before secret sourcing existed keep working without a data migration.
+// A padded value is trimmed here, unlike commandSourceOrDefault: no UI
+// visibility condition reads this field, so there is no cross-side agreement
+// that a verbatim value would protect.
+func (v EnvironmentVariable) valueSourceOrDefault() string {
+	source := strings.TrimSpace(v.ValueSource)
+	if source == "" {
+		return EnvironmentValueSourceLiteral
+	}
+	return source
+}
+
+// resolvedEnvVar is an environment variable with its value already in hand.
+// Command construction works on these rather than on EnvironmentVariable so it
+// stays free of the secrets context, and the Secret flag tells it which values
+// must travel over stdin instead of the command line.
+type resolvedEnvVar struct {
+	Name   string
+	Value  string
+	Secret bool
+}
+
+// resolveEnvironment reads secret-backed values through the secrets context.
+// It runs on every attempt rather than once at setup, so retries pick up a
+// rotated secret and no resolved value is ever written to execution metadata.
+func resolveEnvironment(secrets core.SecretsContext, environment []EnvironmentVariable) ([]resolvedEnvVar, error) {
+	resolved := make([]resolvedEnvVar, 0, len(environment))
+
+	for _, variable := range environment {
+		if variable.valueSourceOrDefault() != EnvironmentValueSourceSecret {
+			resolved = append(resolved, resolvedEnvVar{Name: variable.Name, Value: variable.Value})
+			continue
+		}
+
+		if secrets == nil {
+			return nil, fmt.Errorf("environment variable %s: secrets are not available", variable.Name)
+		}
+
+		value, err := secrets.GetKey(variable.Secret.Secret, variable.Secret.Key)
+		if err != nil {
+			return nil, fmt.Errorf("environment variable %s: %w", variable.Name, err)
+		}
+
+		resolved = append(resolved, resolvedEnvVar{Name: variable.Name, Value: string(value), Secret: true})
+	}
+
+	return resolved, nil
+}
+
+// validateEnvironment runs at publish time and again at execution time, so a
+// node that was valid when saved cannot reach the remote host with an
+// environment the worker cannot resolve.
+func validateEnvironment(environment []EnvironmentVariable) error {
+	for _, variable := range environment {
+		if variable.Name == "" {
+			return errors.New("environment variable name is required")
+		}
+		if !environmentVariableNameRegex.MatchString(variable.Name) {
+			return fmt.Errorf("invalid environment variable name: %s", variable.Name)
+		}
+
+		switch variable.valueSourceOrDefault() {
+		case EnvironmentValueSourceLiteral:
+			// A literal carries its value inline; nothing else to check.
+		case EnvironmentValueSourceSecret:
+			if !variable.Secret.IsSet() {
+				return fmt.Errorf("environment variable %s: secret name and key are required", variable.Name)
+			}
+		default:
+			return fmt.Errorf("invalid environment variable value source: %s", variable.ValueSource)
+		}
+	}
+
+	return nil
 }
 
 type Spec struct {
@@ -140,7 +230,7 @@ Choose **SSH key** or **Password**, then select the organization Secret and the 
 - **Commands** (inline mode): One or more commands to run, one per line (supports expressions). Each non-empty line becomes a command joined with &&. The output payload is based on the last command.
 - **Command file** (file mode): Path to a file in the app's repository (e.g. ` + "`scripts/deploy.sh`" + `).
 - **Working directory**: Optional; Changes to this directory before running the command.
-- **Environment variables**: Optional list of key/value pairs available during command execution.
+- **Environment variables**: Optional list of variables available during command execution. Each variable takes either a literal value or a key from an organization secret. A secret-backed value is read when the command runs and is sent over stdin rather than on the command line, so it does not appear in the process list on the remote host.
 - **Timeout (seconds)**: How long the command may run (default 60).
 - **Connection retry** (optional): Enable to retry connecting when the host is not reachable yet (e.g. server still booting). Set number of retries and interval between attempts.
 - **Execution retry** (optional): Enable to retry running the command when the exit status is not 0. Set number of retries and interval between attempts.
@@ -321,12 +411,42 @@ func (c *SSHCommand) Configuration() []configuration.Field {
 								Required:    true,
 							},
 							{
-								Name:        "value",
-								Label:       "Value",
-								Type:        configuration.FieldTypeString,
-								Description: "Environment variable value",
-								Placeholder: "e.g. production",
-								Required:    true,
+								// Optional at the schema level because variables
+								// saved before this field existed omit it and
+								// ValidateConfiguration does not apply Default.
+								Name:        "valueSource",
+								Label:       "Value source",
+								Type:        configuration.FieldTypeSelect,
+								Description: "Where this variable value comes from",
+								Required:    false,
+								Default:     EnvironmentValueSourceLiteral,
+								TypeOptions: &configuration.TypeOptions{
+									Select: &configuration.SelectTypeOptions{
+										Options: []configuration.FieldOption{
+											{Label: "Literal value", Value: EnvironmentValueSourceLiteral},
+											{Label: "Secret key", Value: EnvironmentValueSourceSecret},
+										},
+									},
+								},
+							},
+							{
+								Name:                 "value",
+								Label:                "Value",
+								Type:                 configuration.FieldTypeString,
+								Description:          "Environment variable value",
+								Placeholder:          "e.g. production",
+								Required:             false,
+								VisibilityConditions: []configuration.VisibilityCondition{{Field: "valueSource", Values: []string{EnvironmentValueSourceLiteral}}},
+								RequiredConditions:   []configuration.RequiredCondition{{Field: "valueSource", Values: []string{EnvironmentValueSourceLiteral}}},
+							},
+							{
+								Name:                 "secret",
+								Label:                "Secret key",
+								Type:                 configuration.FieldTypeSecretKey,
+								Description:          "Stored credential key to use as the variable value. Sent to the host over stdin, never on the command line.",
+								Required:             false,
+								VisibilityConditions: []configuration.VisibilityCondition{{Field: "valueSource", Values: []string{EnvironmentValueSourceSecret}}},
+								RequiredConditions:   []configuration.RequiredCondition{{Field: "valueSource", Values: []string{EnvironmentValueSourceSecret}}},
 							},
 						},
 					},
@@ -455,13 +575,8 @@ func (c *SSHCommand) Setup(ctx core.SetupContext) error {
 	if spec.Timeout < 1 {
 		return errors.New("timeout is required and must be at least 1 second")
 	}
-	for _, variable := range spec.Environment {
-		if variable.Name == "" {
-			return errors.New("environment variable name is required")
-		}
-		if !environmentVariableNameRegex.MatchString(variable.Name) {
-			return fmt.Errorf("invalid environment variable name: %s", variable.Name)
-		}
+	if err := validateEnvironment(spec.Environment); err != nil {
+		return err
 	}
 
 	switch spec.Authentication.Method {
@@ -517,13 +632,8 @@ func (c *SSHCommand) Execute(ctx core.ExecutionContext) error {
 		resolvedCommands = spec.Commands
 	}
 
-	for _, variable := range spec.Environment {
-		if variable.Name == "" {
-			return errors.New("environment variable name is required")
-		}
-		if !environmentVariableNameRegex.MatchString(variable.Name) {
-			return fmt.Errorf("invalid environment variable name: %s", variable.Name)
-		}
+	if err := validateEnvironment(spec.Environment); err != nil {
+		return err
 	}
 
 	metadata := ExecutionMetadata{
@@ -674,7 +784,14 @@ func (c *SSHCommand) executeSSH(ctx ExecuteSSHContext) error {
 	}
 	defer client.Close()
 
-	command, stdin, err := c.buildExecutionCommand(ctx.execMetadata, ctx.scriptBody)
+	// Resolved on every attempt, including retries, so no secret value is kept
+	// between attempts and a rotated secret is picked up.
+	environment, err := resolveEnvironment(ctx.secretsCtx, ctx.execMetadata.Environment)
+	if err != nil {
+		return err
+	}
+
+	command, stdin, err := c.buildExecutionCommand(ctx.execMetadata, environment, ctx.scriptBody)
 	if err != nil {
 		return err
 	}
@@ -835,23 +952,34 @@ func (c *SSHCommand) isConnectError(err error) bool {
 		strings.Contains(s, "no route to host")
 }
 
-func (c *SSHCommand) buildRemoteCommand(workingDirectory string, environment []EnvironmentVariable, command string) string {
+// buildRemoteCommand returns the command for a single-line invocation and the
+// stdin payload carrying its secret variables, if any. Secrets are sourced with
+// `eval "$(cat)"` rather than placed in the `env` prefix so they stay out of the
+// remote process list; `sh -lc` is kept either way so login-shell PATH and
+// profile handling are unchanged.
+func (c *SSHCommand) buildRemoteCommand(workingDirectory string, environment []resolvedEnvVar, command string) (string, string) {
 	finalCommand := command
 
 	if workingDirectory != "" {
 		finalCommand = fmt.Sprintf("cd %s && %s", shellQuote(workingDirectory), finalCommand)
 	}
 
-	if len(environment) == 0 {
-		return finalCommand
+	exports := exportStatements(environment)
+	assignments := envAssignments(environment)
+	if exports == "" && assignments == "" {
+		return finalCommand, ""
 	}
 
-	envAssignments := make([]string, 0, len(environment))
-	for _, variable := range environment {
-		envAssignments = append(envAssignments, fmt.Sprintf("%s=%s", variable.Name, shellQuote(variable.Value)))
+	if exports != "" {
+		finalCommand = `eval "$(cat)"; ` + finalCommand
 	}
 
-	return fmt.Sprintf("env %s sh -lc %s", strings.Join(envAssignments, " "), shellQuote(finalCommand))
+	remoteCommand := fmt.Sprintf("sh -lc %s", shellQuote(finalCommand))
+	if assignments != "" {
+		remoteCommand = fmt.Sprintf("env %s %s", assignments, remoteCommand)
+	}
+
+	return remoteCommand, exports
 }
 
 // buildExecutionCommand assembles the final command sent to the remote host
@@ -869,17 +997,17 @@ func (c *SSHCommand) buildRemoteCommand(workingDirectory string, environment []E
 // process substitution) except for normalizing CRLF/CR line endings to LF. The
 // stream is always interpreted by bash, so any leading `#!` line is just a
 // comment: non-bash shebangs are not honored.
-func (c *SSHCommand) buildExecutionCommand(metadata ExecutionMetadata, scriptBody string) (string, io.Reader, error) {
+func (c *SSHCommand) buildExecutionCommand(metadata ExecutionMetadata, environment []resolvedEnvVar, scriptBody string) (string, io.Reader, error) {
 	if metadata.CommandSource == CommandSourceFile {
 		if scriptBody == "" {
 			return "", nil, errors.New("command file body is required")
 		}
-		command, payload := c.buildScriptCommand(metadata.WorkingDirectory, metadata.Environment, scriptBody)
+		command, payload := c.buildScriptCommand(metadata.WorkingDirectory, environment, scriptBody)
 		return command, strings.NewReader(payload), nil
 	}
 
 	if isMultilineInlineScript(metadata.Commands) {
-		command, payload := c.buildInlineScriptCommand(metadata.WorkingDirectory, metadata.Environment, metadata.Commands)
+		command, payload := c.buildInlineScriptCommand(metadata.WorkingDirectory, environment, metadata.Commands)
 		return command, strings.NewReader(payload), nil
 	}
 
@@ -887,37 +1015,73 @@ func (c *SSHCommand) buildExecutionCommand(metadata ExecutionMetadata, scriptBod
 	if combined == "" {
 		return "", nil, errors.New("commands is required")
 	}
-	return c.buildRemoteCommand(metadata.WorkingDirectory, metadata.Environment, combined), nil, nil
+
+	command, exports := c.buildRemoteCommand(metadata.WorkingDirectory, environment, combined)
+	if exports == "" {
+		return command, nil, nil
+	}
+	return command, strings.NewReader(exports), nil
 }
 
 // buildScriptCommand returns the remote command (`env VAR=v ... bash -s`) and
 // the script body to stream over stdin. The working-directory change is
 // prepended on its own line (followed by `|| exit 1`) so a leading shebang or
 // comment in the script cannot swallow the `cd` via `#`-to-end-of-line.
-func (c *SSHCommand) buildScriptCommand(workingDirectory string, environment []EnvironmentVariable, script string) (string, string) {
+func (c *SSHCommand) buildScriptCommand(workingDirectory string, environment []resolvedEnvVar, script string) (string, string) {
 	return c.buildScriptCommandWithShell("bash -s", workingDirectory, environment, script)
 }
 
-func (c *SSHCommand) buildInlineScriptCommand(workingDirectory string, environment []EnvironmentVariable, script string) (string, string) {
+func (c *SSHCommand) buildInlineScriptCommand(workingDirectory string, environment []resolvedEnvVar, script string) (string, string) {
 	return c.buildScriptCommandWithShell("bash -e -s", workingDirectory, environment, script)
 }
 
-func (c *SSHCommand) buildScriptCommandWithShell(shellCommand string, workingDirectory string, environment []EnvironmentVariable, script string) (string, string) {
+func (c *SSHCommand) buildScriptCommandWithShell(shellCommand string, workingDirectory string, environment []resolvedEnvVar, script string) (string, string) {
 	payload := normalizeScriptLineEndings(script)
 	if workingDirectory != "" {
 		payload = fmt.Sprintf("cd %s || exit 1\n%s", shellQuote(workingDirectory), payload)
 	}
 
+	// Secret values are exported at the head of the stdin payload so they never
+	// appear in the remote process list, unlike the `env` prefix below.
+	if exports := exportStatements(environment); exports != "" {
+		payload = exports + payload
+	}
+
 	command := shellCommand
-	if len(environment) > 0 {
-		envAssignments := make([]string, 0, len(environment))
-		for _, variable := range environment {
-			envAssignments = append(envAssignments, fmt.Sprintf("%s=%s", variable.Name, shellQuote(variable.Value)))
-		}
-		command = fmt.Sprintf("env %s %s", strings.Join(envAssignments, " "), command)
+	if assignments := envAssignments(environment); assignments != "" {
+		command = fmt.Sprintf("env %s %s", assignments, command)
 	}
 
 	return command, payload
+}
+
+// envAssignments renders the non-secret variables as an `env` prefix. It
+// returns an empty string when there is nothing to assign, so a command without
+// literal variables keeps the exact shape it had before secrets existed.
+func envAssignments(environment []resolvedEnvVar) string {
+	assignments := make([]string, 0, len(environment))
+	for _, variable := range environment {
+		if variable.Secret {
+			continue
+		}
+		assignments = append(assignments, fmt.Sprintf("%s=%s", variable.Name, shellQuote(variable.Value)))
+	}
+
+	return strings.Join(assignments, " ")
+}
+
+// exportStatements renders the secret variables as shell `export` lines, each
+// terminated by a newline so the caller can prepend them to a script body.
+func exportStatements(environment []resolvedEnvVar) string {
+	var exports strings.Builder
+	for _, variable := range environment {
+		if !variable.Secret {
+			continue
+		}
+		fmt.Fprintf(&exports, "export %s=%s\n", variable.Name, shellQuote(variable.Value))
+	}
+
+	return exports.String()
 }
 
 // validateCommandSource enforces the configured command-source variant.
