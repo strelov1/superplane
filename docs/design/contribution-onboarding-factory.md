@@ -28,20 +28,28 @@ digest-канвасом через мастер установки с `install_p
 
 ```
 web_src/src/pages/home/factories/contribution-onboarding/
-  canvas.yaml     — граф: Schedule + Run Now → Run Claude Code → уведомление
-  console.yaml    — панель: runbook, ссылка на последний PR, состояние очереди
-  factory.json    — id, title, integrations, componentIntegrations, run, startingTasks
+  canvas.yaml     — граф: расписание + ручной запуск → Run Claude Code → уведомление
+  console.yaml    — панели: кнопка «прогнать сейчас» и runbook
+  factory.json    — id, title, integrations, componentIntegrations, run, agentSuggestions
   params.json     — install_params
+  README.md       — что нужно для установки и две ловушки при правке шагов
 web_src/src/pages/home/factories/index.ts   — регистрация в FACTORY_BY_ID
 ```
+
+Регистрация делает фабрику доступной по `getFactoryDefinition("contribution-onboarding")` и
+`useInstallFactory({ factoryId })`, но **точки входа в UI у неё нет**: `FreshOrgLanding` и
+`FactorySetupPanel` зовут `getFactoryDefinition()` без аргумента, то есть всегда фабрику по
+умолчанию. Пока список фабрик не выведен в интерфейс, canvas ставится программно или
+применяется напрямую (`superplane apps create --file canvas.yaml`, предварительно подставив
+значения `install_params` — CLI их не подставляет).
 
 ## Топология canvas
 
 ```
-[Schedule · cron]        [Run Now · onRun]
+[Every day · schedule]    [Run now · start]
         \                      /
          \                    /
-      [Run Claude Code · Onboard contributions]
+      [Run Claude Code · Onboard Contributions]
                     |
         passed      |      failed
           ↓                 ↓
@@ -53,8 +61,15 @@ web_src/src/pages/home/factories/index.ts   — регистрация в FACTOR
 борд, помнит это на шаге написания PR-описания. Разрезать на узлы — потерять контекст и
 передавать состояние через выражения.
 
-`onRun` рядом с `Schedule` даёт кнопку «прогнать сейчас» и закрывает обязательное поле
-`run` в `factory.json`.
+Триггер `start` с шаблоном «Drain Queue» рядом с расписанием даёт кнопку «прогнать сейчас» в
+консоли и закрывает обязательное поле `run` в `factory.json`. Параметров у шаблона нет:
+у прогона нет входных данных, вся работа приходит из очереди.
+
+Шаги внутри узла **исполняются одним шеллом**: `pkg/components/runner/claude/spec.go:275`
+запускает каждый bash-шаг через `source`. Отсюда два правила, без которых шаблон ломается
+тихо: шаг завершается досрочно через `return`, а не `exit` (иначе умирает весь прогон), и
+каждый шаг начинается с `cd "$RUN_ROOT"`, потому что `cd` из предыдущего шага никуда не
+девается. Первое правило закреплено тестом в `materializeFactoryTemplate.spec.ts`.
 
 ## Конфигурация узла Run Claude Code
 
@@ -96,15 +111,21 @@ configuration:
 
 | # | тип | содержание |
 |---|-----|-----------|
-| 1 | bash | `PROD_SSH_KEY` → `~/.ssh/id_ed25519` (chmod 600), `ssh-keyscan` хоста в `known_hosts`, `git config user.name/user.email` |
-| 2 | bash | клон `$REPO` по `GITHUB_TOKEN` в `repo/`, `git checkout main` |
-| 3 | bash | реконсиляция: борды из очереди, уже лежащие в `sources/*.yml` на `origin/main`, переводятся в `onboarded` |
-| 4 | bash | дамп рабочей очереди в `queue.tsv`; гарды (см. ниже) пишут маркер `SKIP` |
-| 5 | bash | ветка `feat/onboard-contributed-boards-<YYYYMMDD>` |
-| 6 | prompt | процедура онбординга бордов (инлайн) |
-| 7 | bash | `go build ./...`, `git commit -s`, push, `gh pr create --label onboard-contributions` |
-| 8 | prompt | (опц.) один новый адаптер для `review`-строки |
-| 9 | bash | отдельная ветка + PR для адаптера |
+| 1 | bash | Prepare access: `RUN_ROOT`, `PROD_SSH_KEY` → `~/.ssh/id_ed25519` (chmod 600), `ssh-keyscan` в `known_hosts`, git identity, хелпер `/tmp/prod_psql.sh` |
+| 2 | bash | Checkout repository: клон `$REPO` по `GITHUB_TOKEN` в `repo/` |
+| 3 | bash | Reconcile merged boards: борды из очереди, уже лежащие в `sources/*.yml` на `main`, переводятся в `onboarded` |
+| 4 | bash | Read queue: дамп очереди + гарды, пишущие маркер `SKIP` |
+| 5 | bash | Create board branch: `feat/onboard-contributed-boards-<YYYYMMDD>` |
+| 6 | prompt | Onboard contributed boards: процедура онбординга (инлайн) |
+| 7 | bash | Open board pull request: `go build ./...`, `git commit -s`, push, `gh pr create --label onboard-contributions` |
+| 8 | bash | Start adapter branch: `feat/onboard-new-adapter-<YYYYMMDD>` от `main` |
+| 9 | prompt | Write one new adapter: не больше одного адаптера за прогон |
+| 10 | bash | Open adapter pull request: `go build`, `go test ./internal/sources/...`, отдельный PR |
+| 11 | prompt | Report the run: текст, который уходит в Telegram |
+
+Последний шаг обязан быть промптом: finished-событие несёт один `result` — то, что последний
+шаг записал в `$SUPERPLANE_RESULT_FILE` (`runner_task_lifecycle.go:134` эмитит
+`[]any{out}`), а узлы Telegram читают `data[0].result.result`.
 
 ### Шаг 3 — реконсиляция
 
@@ -161,7 +182,7 @@ Prompt-шаг условно пропустить нельзя — он выпо
 Валидация — только `curl`: `run.js:70` запускает CLI с `--allowedTools Bash,Read,Edit,Write`,
 без `WebFetch` и `WebSearch`.
 
-### Шаги 8–9 — новый адаптер
+### Шаги 8–10 — новый адаптер
 
 Борды и адаптеры разъезжаются по разным PR: список из двух строк YAML ревьюится за минуту,
 новый Go-адаптер — это код с тестами, и общий diff блокирует дешёвое дорогим. Не больше одного
@@ -172,11 +193,17 @@ Prompt-шаг условно пропустить нельзя — он выпо
 | имя | тип | назначение |
 |---|---|---|
 | `repository` | `integration-resource` (github/repository, `useNameAsValue`) | целевой репозиторий |
+| `cronExpression` | `string` | расписание в UTC, по умолчанию `17 5 * * *` |
 | `machineType` | `string` | fleet раннера, напр. `e1-large-amd64` |
 | `prodSshHost` | `string` | `user@host` продовой БД |
 | `prodDbName` | `string` | имя базы, по умолчанию `hire` |
 | `sshSecret` | `secret_picker` (`secretKey: private_key`) | приватный ключ для ssh на прод |
 | `telegramChatId` | `string` | чат для итога прогона (для групп и каналов — отрицательный) |
+| `gitUserName` | `string` | автор коммитов, по умолчанию `superplane-agent` |
+| `gitUserEmail` | `string` | адрес автора; им же подписывается DCO |
+
+Тест в `materializeFactoryTemplate.spec.ts` сверяет этот список с плейсхолдерами в
+`canvas.yaml` в обе стороны — забытый параметр не доедет до установки молча.
 
 Уведомления — `telegram.sendMessage`: freehire уже доставляет туда дайджесты, отдельная
 интеграция не нужна. Бот должен состоять в чате, иначе узел упадёт на первом же прогоне.
@@ -189,11 +216,14 @@ Prompt-шаг условно пропустить нельзя — он выпо
 
 ## Результат прогона
 
-Результат — **отправленный PR**, а не отчёт о проделанной работе. Прогон считается успешным
-ровно в двух случаях: открыт PR (ссылка уходит в Telegram) или очередь была пуста. Всё
-остальное — падение узла, в том числе случай, когда агент отредактировал `sources/*.yml`, но
-не смог запушить ветку или создать PR: шаг 7 проверяет, что `gh pr create` вернул URL, и
-выходит с ненулевым кодом, если нет.
+Результат — **отправленный PR**, а не отчёт о проделанной работе. Прогон успешен, когда открыт
+PR (ссылка уходит в Telegram) либо когда открывать нечего: очередь пуста, предыдущий PR ещё
+висит, или ни один контрибьютнутый борд не прошёл валидацию. Во всех трёх случаях `sources/`
+не изменился.
+
+Случай «`sources/` изменился, а PR нет» — падение, а не успех: шаг 7 проверяет, что
+`gh pr create` вернул URL, и возвращает ненулевой код, если нет. Иначе прогон отчитался бы об
+успехе, оставив работу в непушнутой ветке на удаляемой машине.
 
 ## Обработка ошибок
 
@@ -206,11 +236,14 @@ Prompt-шаг условно пропустить нельзя — он выпо
 
 ## Приёмка
 
-1. `superplane apps create --file canvas.yaml` (или установка фабрики) проходит валидацию.
+1. `canvas.yaml` разбирается схемой (`pkg/yaml.CanvasFromYAML`), а конфигурация узла проходит
+   `validateRunClaudeCodeSpec` и собирается в задачу брокера из 11 шагов — проверено разово
+   при реализации.
 2. Прогон при пустой очереди: узел **Passed**, PR не создан, прод не изменён.
 3. Прогон с одной `pending`-строкой на живом борде: PR с одной строкой в `sources/<source>.yml`,
    `board` совпадает с таблицей побайтно, статус в проде не изменён до мержа.
-4. Прогон с мёртвым бордом: PR не содержит этого борда, строка отмечена `rejected`.
+4. Прогон с мёртвым бордом: борда нет ни в `sources/`, ни в PR; строка остаётся `pending`, а её
+   `id` попадает в тело PR готовым `UPDATE … SET status='rejected'`.
 5. Повторный прогон при открытом PR с меткой: `SKIP`, второй PR не создаётся.
 6. Прогон после мержа PR из п.3: строка переходит в `onboarded`.
 

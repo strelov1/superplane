@@ -1,0 +1,436 @@
+apiVersion: v1
+kind: Canvas
+metadata:
+  name: Contribution Onboarding
+  description: Drain the crowdsourced board contribution queue into a pull request, once a day.
+spec:
+  nodes:
+    - id: annotation-how-it-works
+      name: How it works
+      type: TYPE_WIDGET
+      component: annotation
+      configuration:
+        color: yellow
+        text: |-
+          ## Contribution Onboarding
+
+          Every day the agent reads the contribution queue on production, validates each
+          contributed board live, adds the good ones to `sources/<source>.yml` and opens a
+          pull request.
+
+          A human merges. Nothing is written to production except boards that are already
+          in `main` — those rows are flipped to `onboarded` at the start of the next run.
+      position:
+        x: 72
+        'y': -336
+      isCollapsed: false
+
+    - id: schedule-daily
+      name: Every day
+      type: TYPE_TRIGGER
+      component: schedule
+      configuration:
+        type: cron
+        cronExpression: '{{ install_params.cronExpression }}'
+        timezone: '0'
+      position:
+        x: 72
+        'y': 0
+      isCollapsed: false
+
+    - id: drain-queue-start
+      name: Run now
+      type: TYPE_TRIGGER
+      component: start
+      configuration:
+        templates:
+          - name: Drain Queue
+            payload:
+              manual: true
+      position:
+        x: 72
+        'y': 264
+      isCollapsed: false
+
+    - id: onboard-contributions
+      name: Onboard Contributions
+      type: TYPE_ACTION
+      component: runnerClaudeCode
+      configuration:
+        machineType: '{{ install_params.machineType }}'
+        executionTimeoutSeconds: 7200
+        credentials:
+          source: integration
+          integration:
+            name: claude
+        environmentFrom:
+          - source: integration
+            integration:
+              name: github
+        environment:
+          - name: REPO
+            value: '{{ install_params.repository }}'
+            valueSource: literal
+          - name: PROD_SSH_HOST
+            value: '{{ install_params.prodSshHost }}'
+            valueSource: literal
+          - name: PROD_DB
+            value: '{{ install_params.prodDbName }}'
+            valueSource: literal
+          - name: GIT_USER_NAME
+            value: '{{ install_params.gitUserName }}'
+            valueSource: literal
+          - name: GIT_USER_EMAIL
+            value: '{{ install_params.gitUserEmail }}'
+            valueSource: literal
+          - name: PROD_SSH_KEY
+            valueSource: secret
+            secret:
+              secret: '{{ install_params.sshSecret }}'
+              key: private_key
+        steps:
+          - name: Prepare access
+            type: bash
+            command: |-
+              set -euo pipefail
+
+              # Steps are sourced into one shell, so a `cd` in any of them leaks into the
+              # next. Every step returns here first instead of trusting the cwd it
+              # inherits. For the same reason steps use `return`, never `exit`: `exit`
+              # would tear down the whole run.
+              export RUN_ROOT="$PWD"
+
+              mkdir -p ~/.ssh && chmod 700 ~/.ssh
+              printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/id_ed25519
+              chmod 600 ~/.ssh/id_ed25519
+              ssh-keyscan -H "${PROD_SSH_HOST##*@}" >> ~/.ssh/known_hosts
+
+              git config --global user.name "$GIT_USER_NAME"
+              git config --global user.email "$GIT_USER_EMAIL"
+
+              # Every later step (and the agent itself) queries production through this
+              # helper: the table lives only on prod and only postgres can read it.
+              cat > /tmp/prod_psql.sh <<'HELPER'
+              #!/usr/bin/env bash
+              set -euo pipefail
+              ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$PROD_SSH_HOST" \
+                "sudo -u postgres psql -d $PROD_DB -tAF'|' -c \"$1\""
+              HELPER
+              chmod +x /tmp/prod_psql.sh
+
+              rm -f /tmp/SKIP /tmp/PR_URL /tmp/ADAPTER_PR_URL /tmp/pr_body.md \
+                    /tmp/adapter_pr_title.txt /tmp/adapter_pr_body.md /tmp/queue_rejected.tsv
+
+          - name: Checkout repository
+            type: bash
+            command: |-
+              set -euo pipefail
+              cd "$RUN_ROOT"
+              export GH_TOKEN="$GITHUB_TOKEN"
+
+              rm -rf repo
+              git clone --depth 50 "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git" repo
+              git -C repo checkout main
+
+          - name: Reconcile merged boards
+            type: bash
+            command: |-
+              set -euo pipefail
+              cd "$RUN_ROOT"
+
+              # A board counts as onboarded once it is in main, not when its PR opens.
+              # This is the only write production sees, and it only ever confirms what
+              # the repository already says.
+              /tmp/prod_psql.sh "SELECT id, source, board FROM link_contributions WHERE status='pending' AND source IS NOT NULL;" > /tmp/pending.tsv
+
+              : > /tmp/merged_ids.txt
+              while IFS='|' read -r id source board; do
+                [ -n "${board:-}" ] || continue
+                [ -f "repo/sources/${source}.yml" ] || continue
+                if grep -qF "$board" "repo/sources/${source}.yml"; then
+                  echo "$id" >> /tmp/merged_ids.txt
+                fi
+              done < /tmp/pending.tsv
+
+              if [ -s /tmp/merged_ids.txt ]; then
+                ids=$(paste -sd, /tmp/merged_ids.txt)
+                /tmp/prod_psql.sh "UPDATE link_contributions SET status='onboarded' WHERE id IN (${ids});"
+                echo "Reconciled to onboarded: ${ids}"
+              else
+                echo "Nothing to reconcile"
+              fi
+
+          - name: Read queue
+            type: bash
+            command: |-
+              set -euo pipefail
+              cd "$RUN_ROOT"
+              export GH_TOKEN="$GITHUB_TOKEN"
+
+              # Created before it is queried: `gh pr list --label` fails outright on a
+              # label the repository does not have yet.
+              gh label create onboard-contributions --repo "$REPO" --color 0e8a16 \
+                --description "Boards onboarded from the contribution queue" 2>/dev/null || true
+
+              # One open PR at a time. Without this guard a week of runs leaves seven
+              # branches all editing the same sources/*.yml.
+              open_pr=$(gh pr list --repo "$REPO" --state open --label onboard-contributions --json url --jq '.[0].url // ""' || true)
+              if [ -n "$open_pr" ]; then
+                echo "Waiting on an open PR: $open_pr" | tee /tmp/SKIP
+                return 0
+              fi
+
+              /tmp/prod_psql.sh "SELECT min(id), source, board, min(url), count(*) FROM link_contributions WHERE status='pending' AND source IS NOT NULL GROUP BY source, board ORDER BY min(created_at);" > /tmp/queue_pending.tsv
+              /tmp/prod_psql.sh "SELECT id, url FROM link_contributions WHERE status='review' ORDER BY created_at;" > /tmp/queue_review.tsv
+
+              # The rejected pile is a lead list, not a graveyard — but it only changes
+              # when the recognizer changes, so re-triaging it daily buys nothing. Look
+              # at it only when there is no fresh work, 20 rows at a time.
+              if [ ! -s /tmp/queue_pending.tsv ] && [ ! -s /tmp/queue_review.tsv ]; then
+                /tmp/prod_psql.sh "SELECT id, source, board, url FROM link_contributions WHERE status='rejected' ORDER BY created_at LIMIT 20;" > /tmp/queue_rejected.tsv
+                total_rejected=$(/tmp/prod_psql.sh "SELECT count(*) FROM link_contributions WHERE status='rejected';")
+                echo "Re-triaging 20 of ${total_rejected} rejected rows"
+              fi
+
+              if [ ! -s /tmp/queue_pending.tsv ] && [ ! -s /tmp/queue_review.tsv ] && [ ! -s /tmp/queue_rejected.tsv ]; then
+                echo "Queue is empty" | tee /tmp/SKIP
+                return 0
+              fi
+
+              wc -l /tmp/queue_pending.tsv /tmp/queue_review.tsv
+
+          - name: Create board branch
+            type: bash
+            command: |-
+              set -euo pipefail
+              cd "$RUN_ROOT"
+              if [ -f /tmp/SKIP ]; then return 0; fi
+
+              git -C repo checkout -b "feat/onboard-contributed-boards-$(date -u +%Y%m%d)"
+
+          - name: Onboard contributed boards
+            type: prompt
+            prompt: |-
+              If the file /tmp/SKIP exists, do nothing at all and reply exactly NOTHING-TO-DO.
+
+              You are draining the crowdsourced board contribution queue. The repository is
+              checked out at ./repo on a fresh branch off main. Work only inside ./repo.
+
+              Input files, pipe-separated:
+              - /tmp/queue_pending.tsv — recognized boards: id|source|board|url|count
+              - /tmp/queue_review.tsv — unrecognized links: id|url
+              - /tmp/queue_rejected.tsv — may be absent; earlier rejections worth a second look: id|source|board|url
+
+              For every row of /tmp/queue_pending.tsv:
+
+              1. Already onboarded? `grep -F "<board>" repo/sources/<source>.yml`. If it is
+                 there, skip the edit and record it as already present.
+              2. Validate the board live with curl. You have no web tools — only Bash, Read,
+                 Edit and Write. Recipes by source:
+                 - greenhouse: GET https://job-boards.greenhouse.io/<board> → 200 with jobs
+                 - lever: GET https://api.lever.co/v0/postings/<board>?mode=json → non-empty array
+                 - ashby: POST https://api.ashbyhq.com/posting-api/job-board/<board> → jobs
+                 - recruitee and other subdomain ATS: GET https://<board> → 200 careers page
+                 - zohorecruit: GET https://<board>/jobs/Careers → 200
+                 - inhire: GET https://api.inhire.app/job-posts/public/pages with header
+                   `X-Tenant: <board>` → non-empty jobsPage
+                 - workday (<host>/<site>): GET https://<host>/wday/cxs/<tenant>/<site>/jobs → 200
+                 - anything else: read internal/sources/<source>.go, find the public listing
+                   URL and required headers, and probe that.
+                 0 jobs, 404 or a hard block means the board is dead: record it as rejected and
+                 do not add it. When you cannot tell whether a board is live, reject it — a
+                 phantom board burns crawl budget every cycle, and a real board can be
+                 contributed again.
+              3. Resolve the company display name, cheapest signal first: og:site_name, then
+                 <title>, then a name field in the adapter's JSON, then a humanized slug.
+                 Prefer the real brand name.
+              4. Append it to repo/sources/<source>.yml, following that file's own ordering and
+                 quoting. Most files are flat append-only lists; zohorecruit.yml is sorted
+                 alphabetically by board, so insert in position rather than at the end.
+
+                     - company: <Display Name>
+                       board: <board copied byte for byte from the queue>
+
+              Copy `board` verbatim — never re-derive, re-case or trim it. Ingest dedups with
+              `external_id LIKE '<board>:%'`, so any change silently doubles the board, and
+              Workday site case is significant.
+
+              Rules:
+              - One bad board must not stop the run: note it and move to the next row.
+              - Do not reformat unrelated entries and do not touch anything outside repo/sources/.
+              - Never commit or push. A later step does that.
+
+              Then write /tmp/pr_body.md — the pull request description:
+              - a table of onboarded boards: source, board, company, how you validated it
+              - the boards you turned down, with the reason
+              - rows from /tmp/queue_review.tsv you could not resolve, marked as needing a human
+              - the SQL for whoever merges, so the queue matches the repository:
+                UPDATE link_contributions SET status='onboarded' WHERE id IN (...);
+                UPDATE link_contributions SET status='rejected' WHERE id IN (...);
+
+              Finish with one line: onboarded=<n> rejected=<n> skipped=<n>
+
+          - name: Open board pull request
+            type: bash
+            command: |-
+              set -euo pipefail
+              cd "$RUN_ROOT"
+              if [ -f /tmp/SKIP ]; then return 0; fi
+              export GH_TOKEN="$GITHUB_TOKEN"
+
+              cd repo
+              if git diff --quiet -- sources; then
+                echo "No board passed validation — nothing to open a PR for" | tee /tmp/NO_BOARDS
+                cd "$RUN_ROOT"
+                return 0
+              fi
+
+              go build ./...
+
+              git add sources
+              git commit -s -m "feat(sources): onboard contributed boards"
+              git push -u origin HEAD
+
+              url=$(gh pr create --repo "$REPO" \
+                --title "feat(sources): onboard contributed boards" \
+                --body-file /tmp/pr_body.md \
+                --label onboard-contributions)
+              # The run's deliverable is a pull request. Editing sources and failing to
+              # open one must fail loudly, not pass with a summary.
+              if [ -z "$url" ]; then echo "gh pr create returned no URL" >&2; return 1; fi
+              echo "$url" | tee /tmp/PR_URL
+              cd "$RUN_ROOT"
+
+          - name: Start adapter branch
+            type: bash
+            command: |-
+              set -euo pipefail
+              cd "$RUN_ROOT"
+              if [ -f /tmp/SKIP ]; then return 0; fi
+              if [ ! -s /tmp/queue_review.tsv ]; then return 0; fi
+
+              # Everything worth keeping was committed and pushed by the previous step;
+              # what is left here is the agent's scratch.
+              git -C repo checkout -- . 2>/dev/null || true
+              git -C repo checkout main
+              git -C repo checkout -b "feat/onboard-new-adapter-$(date -u +%Y%m%d)"
+
+          - name: Write one new adapter
+            type: prompt
+            prompt: |-
+              If /tmp/SKIP exists, or /tmp/queue_review.tsv is empty, reply exactly NO-ADAPTER
+              and do nothing.
+
+              The review queue holds links the recognizer could not map to a supported ATS.
+              Most of them are a company's own careers page fronting an ATS already crawled.
+
+              1. Before fetching anything, settle them with one catalogue query. Guess company
+                 slugs from the URLs and ask production:
+
+                     /tmp/prod_psql.sh "SELECT company_slug, source, count(*) FROM jobs WHERE company_slug IN ('acme','globex') GROUP BY 1,2 ORDER BY 1;"
+
+                 Anything already crawled needs no adapter. Append it to /tmp/pr_body.md under
+                 "already covered", with the source and job count.
+              2. From what is left, pick at most ONE row that is a real, ingestable ATS with a
+                 public listing endpoint, and write its adapter in internal/sources, following
+                 the closest existing adapter in that package. Add its board file under
+                 sources/ and a test alongside the neighbouring adapters' tests.
+                 Single-tenant pages, dead sites, login walls and aggregators are not
+                 ingestable — leave them for a human.
+              3. If nothing qualifies, reply NO-ADAPTER and write nothing.
+
+              When you do write an adapter, also write:
+              - /tmp/adapter_pr_title.txt — one line, e.g. `feat(sources): add <ats> adapter`
+              - /tmp/adapter_pr_body.md — what the ATS is, the endpoint you measured, which
+                contribution row (id and URL) led here, and how you validated it
+
+              Do not commit or push; the next step does. Never touch sources/*.yml entries that
+              belong to the board branch.
+
+          - name: Open adapter pull request
+            type: bash
+            command: |-
+              set -euo pipefail
+              cd "$RUN_ROOT"
+              if [ -f /tmp/SKIP ]; then return 0; fi
+              if [ ! -f /tmp/adapter_pr_title.txt ]; then echo "No adapter this run"; return 0; fi
+              export GH_TOKEN="$GITHUB_TOKEN"
+
+              cd repo
+              go build ./...
+              go test ./internal/sources/...
+
+              git add -A
+              git commit -s -m "$(cat /tmp/adapter_pr_title.txt)"
+              git push -u origin HEAD
+
+              url=$(gh pr create --repo "$REPO" \
+                --title "$(cat /tmp/adapter_pr_title.txt)" \
+                --body-file /tmp/adapter_pr_body.md)
+              if [ -z "$url" ]; then echo "gh pr create returned no URL" >&2; return 1; fi
+              echo "$url" | tee /tmp/ADAPTER_PR_URL
+              cd "$RUN_ROOT"
+
+          - name: Report the run
+            type: prompt
+            prompt: |-
+              Write the message that goes to Telegram. Plain text, at most eight lines, no
+              Markdown. This is the last step, so your reply is the run's result.
+
+              Read /tmp/SKIP, /tmp/NO_BOARDS, /tmp/PR_URL and /tmp/ADAPTER_PR_URL if they
+              exist (missing files just mean that path was not taken) and report:
+
+              - the pull request URL, or why there is none (queue empty, an earlier PR still
+                open, or every contributed board turned out to be dead)
+              - how many boards were onboarded and how many rejected
+              - the adapter PR URL when there is one
+              - anything a human has to pick up: unresolved review rows, rejected rows you did
+                not get to
+      position:
+        x: 720
+        'y': 72
+      isCollapsed: false
+
+    - id: notify-result
+      name: Report to Telegram
+      type: TYPE_ACTION
+      component: telegram.sendMessage
+      configuration:
+        chatId: '{{ install_params.telegramChatId }}'
+        text: |-
+          Contribution onboarding
+
+          {{ $["Onboard Contributions"].data[0].result.result }}
+      position:
+        x: 1416
+        'y': 0
+      isCollapsed: false
+
+    - id: notify-failure
+      name: Report failure to Telegram
+      type: TYPE_ACTION
+      component: telegram.sendMessage
+      configuration:
+        chatId: '{{ install_params.telegramChatId }}'
+        text: |-
+          Contribution onboarding FAILED (exit {{ $["Onboard Contributions"].data[0].exit_code }})
+
+          {{ $["Onboard Contributions"].data[0].error }}
+      position:
+        x: 1416
+        'y': 336
+      isCollapsed: false
+
+  edges:
+    - sourceId: schedule-daily
+      targetId: onboard-contributions
+      channel: default
+    - sourceId: drain-queue-start
+      targetId: onboard-contributions
+      channel: default
+    - sourceId: onboard-contributions
+      targetId: notify-result
+      channel: passed
+    - sourceId: onboard-contributions
+      targetId: notify-failure
+      channel: failed

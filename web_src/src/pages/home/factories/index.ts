@@ -5,6 +5,10 @@ import factoryMeta from "./software-factory/factory.json";
 import factoryParams from "./software-factory/params.json";
 import softwareFactoryCanvasYaml from "./software-factory/canvas.yaml?raw";
 import softwareFactoryConsoleYaml from "./software-factory/console.yaml?raw";
+import contributionOnboardingMeta from "./contribution-onboarding/factory.json";
+import contributionOnboardingParams from "./contribution-onboarding/params.json";
+import contributionOnboardingCanvasYaml from "./contribution-onboarding/canvas.yaml?raw";
+import contributionOnboardingConsoleYaml from "./contribution-onboarding/console.yaml?raw";
 
 export type { FactoryDefinition, FactoryStartingTask, FactoryRunDefinition } from "./types";
 export {
@@ -32,8 +36,26 @@ function buildSoftwareFactory(): FactoryDefinition {
   };
 }
 
+function buildContributionOnboarding(): FactoryDefinition {
+  return {
+    id: contributionOnboardingMeta.id,
+    title: contributionOnboardingMeta.title,
+    description: contributionOnboardingMeta.description,
+    integrations: contributionOnboardingMeta.integrations,
+    componentIntegrations: contributionOnboardingMeta.componentIntegrations,
+    startingTasks: contributionOnboardingMeta.startingTasks,
+    agentSuggestions: contributionOnboardingMeta.agentSuggestions,
+    run: contributionOnboardingMeta.run as FactoryDefinition["run"],
+    source: contributionOnboardingMeta.source as FactoryDefinition["source"],
+    installParams: contributionOnboardingParams.install_params as InstallParam[],
+    canvasYaml: contributionOnboardingCanvasYaml,
+    consoleYaml: contributionOnboardingConsoleYaml,
+  };
+}
+
 const FACTORY_BY_ID: Record<string, FactoryDefinition> = {
   "software-factory": buildSoftwareFactory(),
+  "contribution-onboarding": buildContributionOnboarding(),
 };
 
 export const DEFAULT_FACTORY_ID = "software-factory";

@@ -1,0 +1,80 @@
+{
+  "install_params": [
+    {
+      "name": "repository",
+      "type": "integration-resource",
+      "integration": "github",
+      "resourceType": "repository",
+      "useNameAsValue": true,
+      "required": true,
+      "label": "Repository",
+      "placeholder": "owner/repo",
+      "description": "The repository holding sources/*.yml — the agent branches from its main and opens the pull request there."
+    },
+    {
+      "name": "cronExpression",
+      "type": "string",
+      "required": true,
+      "label": "Schedule",
+      "default": "17 5 * * *",
+      "description": "Cron expression, UTC. Off the hour, so the run does not queue behind every other daily job."
+    },
+    {
+      "name": "machineType",
+      "type": "string",
+      "required": true,
+      "label": "Runner fleet",
+      "default": "e1-large-amd64",
+      "placeholder": "e1-large-amd64",
+      "description": "A fleet whose machines have claude, git, gh, ssh, curl and the Go toolchain."
+    },
+    {
+      "name": "prodSshHost",
+      "type": "string",
+      "required": true,
+      "label": "Production SSH host",
+      "placeholder": "root@10.0.0.1",
+      "description": "user@host of the machine running the production database. The contribution table lives only there."
+    },
+    {
+      "name": "prodDbName",
+      "type": "string",
+      "required": true,
+      "label": "Database name",
+      "default": "hire",
+      "description": "Database queried over that SSH connection as the postgres user."
+    },
+    {
+      "name": "sshSecret",
+      "type": "secret_picker",
+      "secretKey": "private_key",
+      "required": true,
+      "label": "SSH private key",
+      "description": "Secret holding the private key under the key private_key. Give it the narrowest account that can read link_contributions and flip its status."
+    },
+    {
+      "name": "telegramChatId",
+      "type": "string",
+      "required": true,
+      "label": "Telegram chat",
+      "placeholder": "-1001234567890",
+      "description": "Where the run reports. Negative for groups and channels; the bot has to be a member already."
+    },
+    {
+      "name": "gitUserName",
+      "type": "string",
+      "required": true,
+      "label": "Commit author name",
+      "default": "superplane-agent",
+      "description": "Author on the commits the run pushes."
+    },
+    {
+      "name": "gitUserEmail",
+      "type": "string",
+      "required": true,
+      "label": "Commit author email",
+      "placeholder": "agent@example.com",
+      "description": "Author email on those commits. Commits are signed off with it, so use an address the project accepts for DCO."
+    }
+  ]
+}

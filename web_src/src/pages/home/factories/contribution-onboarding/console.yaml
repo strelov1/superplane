@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: Console
+metadata:
+  name: Contribution Onboarding
+  canvasId: __FACTORY_CANVAS_ID__
+spec:
+  panels:
+    - id: run-now
+      type: nodes
+      content:
+        nodes:
+          - formMode: inline
+            node: drain-queue-start
+            promptConfirmation: false
+            showFieldLabels: false
+            showNodeLabel: false
+            showRun: true
+            submitLabel: Drain the queue now
+            triggerName: Drain Queue
+        title: Run now
+    - id: instructions
+      type: markdown
+      content:
+        body: |
+          > [!SECTION:setup] What this does
+          >
+          > Once a day [Onboard Contributions](node:onboard-contributions) reads the
+          > contribution queue on production, validates every contributed board live, adds
+          > the ones that answer to `sources/<source>.yml`, and opens a pull request.
+          >
+          > You merge it. The board starts being crawled on the next ingest cycle after
+          > `sources` deploys.
+          > [!SECTION:runbook] What the run does, step by step
+          >
+          > 1. Flips rows whose board is already in `main` to `onboarded` — the only write
+          >    production sees.
+          > 2. Reads `pending` and `review` rows. Re-triages up to 20 `rejected` rows, and
+          >    only when there is no fresh work.
+          > 3. Stops early when the queue is empty or an earlier pull request is still open.
+          > 4. Validates each board with curl, edits `sources/<source>.yml`, opens the PR.
+          > 5. At most one new adapter per run, in a pull request of its own.
+          > [!SECTION:run] After the merge
+          >
+          > The pull request body carries the SQL that flips the handled rows. Run it once
+          > the PR is merged, or the next run will offer the same boards again.
+  layout:
+    - i: run-now
+      x: 0
+      'y': 0
+      w: 4
+      h: 6
+      minW: 3
+      minH: 5
+    - i: instructions
+      x: 4
+      'y': 0
+      w: 8
+      h: 12
+      minW: 4
+      minH: 6
