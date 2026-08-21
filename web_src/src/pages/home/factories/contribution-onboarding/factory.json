@@ -1,0 +1,39 @@
+{
+  "id": "contribution-onboarding",
+  "title": "Contribution Onboarding",
+  "description": "Drain a crowdsourced contribution queue into a pull request, once a day.",
+  "integrations": ["github", "claude", "telegram"],
+  "componentIntegrations": {
+    "telegram.sendMessage": "telegram"
+  },
+  "agentSuggestions": [
+    {
+      "id": "adjust-schedule",
+      "label": "Change when the run happens",
+      "prompt": "Change the daily schedule of this Contribution Onboarding canvas. Ask me for the time and timezone, then update the cron expression on the Every day trigger."
+    },
+    {
+      "id": "widen-rejected-retriage",
+      "label": "Re-triage more rejected rows",
+      "prompt": "This canvas re-triages at most 20 rejected contribution rows, and only when there is no pending or review work. Change that budget — ask me for the new limit and whether it should run even when fresh work exists."
+    },
+    {
+      "id": "skip-adapters",
+      "label": "Stop writing new adapters",
+      "prompt": "Remove the new-adapter phase from this Contribution Onboarding canvas so runs only onboard boards for already supported sources. Keep the review rows listed in the pull request body for a human."
+    },
+    {
+      "id": "notify-elsewhere",
+      "label": "Report somewhere else",
+      "prompt": "Replace the Telegram notification nodes on this canvas with a different channel. Ask me which one, then wire the integration and move the message text over."
+    }
+  ],
+  "startingTasks": [],
+  "run": {
+    "nodeId": "drain-queue-start",
+    "hookName": "run",
+    "template": "Drain Queue",
+    "parameters": {}
+  },
+  "source": { "type": "bundled" }
+}

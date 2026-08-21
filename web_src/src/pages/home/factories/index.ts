@@ -13,6 +13,10 @@ import prCanvasYaml from "./line-apps/pr.canvas.yaml?raw";
 import prClosureCanvasYaml from "./line-apps/pr-closure.canvas.yaml?raw";
 import issueIntakeCanvasYaml from "./line-apps/issue-intake.canvas.yaml?raw";
 import issueIntakeConsoleYaml from "./line-apps/issue-intake.console.yaml?raw";
+import contributionOnboardingMeta from "./contribution-onboarding/factory.json";
+import contributionOnboardingParams from "./contribution-onboarding/params.json";
+import contributionOnboardingCanvasYaml from "./contribution-onboarding/canvas.yaml?raw";
+import contributionOnboardingConsoleYaml from "./contribution-onboarding/console.yaml?raw";
 
 export type { FactoryDefinition, FactoryStartingTask, FactoryRunDefinition } from "./types";
 export {
@@ -38,6 +42,23 @@ function buildSoftwareFactory(): FactoryDefinition {
     installParams: factoryParams.install_params as InstallParam[],
     canvasYaml: softwareFactoryCanvasYaml,
     consoleYaml: softwareFactoryConsoleYaml,
+  };
+}
+
+function buildContributionOnboarding(): FactoryDefinition {
+  return {
+    id: contributionOnboardingMeta.id,
+    title: contributionOnboardingMeta.title,
+    description: contributionOnboardingMeta.description,
+    integrations: contributionOnboardingMeta.integrations,
+    componentIntegrations: contributionOnboardingMeta.componentIntegrations,
+    startingTasks: contributionOnboardingMeta.startingTasks,
+    agentSuggestions: contributionOnboardingMeta.agentSuggestions,
+    run: contributionOnboardingMeta.run as FactoryDefinition["run"],
+    source: contributionOnboardingMeta.source as FactoryDefinition["source"],
+    installParams: contributionOnboardingParams.install_params as InstallParam[],
+    canvasYaml: contributionOnboardingCanvasYaml,
+    consoleYaml: contributionOnboardingConsoleYaml,
   };
 }
 
@@ -178,6 +199,7 @@ const FACTORY_BY_ID: Record<string, FactoryDefinition> = {
     canvasYaml: prClosureCanvasYaml,
     triggerNodeId: "on-pr-closed",
   }),
+  "contribution-onboarding": buildContributionOnboarding(),
 };
 
 export const DEFAULT_FACTORY_ID = "software-factory";

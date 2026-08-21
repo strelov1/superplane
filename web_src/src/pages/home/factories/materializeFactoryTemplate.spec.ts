@@ -1,3 +1,4 @@
+import yaml from "js-yaml";
 import { describe, expect, it } from "vitest";
 
 import { getFactoryDefinition } from "./index";
@@ -174,5 +175,83 @@ spec:
   it("exposes separate app and backlog install params on the bundled definition", () => {
     const definition = getFactoryDefinition("software-factory");
     expect(definition.installParams.map((param) => param.name)).toEqual(["appRepository", "backlogRepository"]);
+  });
+});
+
+type ClaudeStep = { name: string; type: string; command?: string; prompt?: string };
+type CanvasNode = { id?: string; component?: string; configuration?: Record<string, unknown> };
+
+function contributionOnboardingSteps(): ClaudeStep[] {
+  const definition = getFactoryDefinition("contribution-onboarding");
+  const doc = yaml.load(definition.canvasYaml) as { spec?: { nodes?: CanvasNode[] } };
+  const node = doc.spec?.nodes?.find((candidate) => candidate.component === "runnerClaudeCode");
+  return (node?.configuration?.steps ?? []) as ClaudeStep[];
+}
+
+describe("contribution-onboarding factory", () => {
+  it("declares an install param for every placeholder it uses", () => {
+    const definition = getFactoryDefinition("contribution-onboarding");
+    const declared = new Set(definition.installParams.map((param) => param.name));
+    const used = new Set(
+      [...definition.canvasYaml.matchAll(/\{\{\s*install_params\.(\w+)\s*\}\}/g)].map((match) => match[1]),
+    );
+
+    expect([...used].filter((name) => !declared.has(name))).toEqual([]);
+    expect([...declared].filter((name) => !used.has(name))).toEqual([]);
+  });
+
+  it("materializes every placeholder and wires the integrations", () => {
+    const canvasYaml = materializeFactoryCanvas({
+      definition: getFactoryDefinition("contribution-onboarding"),
+      canvasName: "Contribution Onboarding",
+      canvasId: "canvas-9",
+      installParams: {
+        repository: "acme/hire",
+        cronExpression: "17 5 * * *",
+        machineType: "e1-large-amd64",
+        prodSshHost: "root@10.0.0.1",
+        prodDbName: "hire",
+        sshSecret: "prod-ssh",
+        telegramChatId: "-100123",
+        gitUserName: "agent",
+        gitUserEmail: "agent@example.com",
+      },
+      integrations: {
+        github: { id: "int-1", name: "acme-github", ready: true },
+        claude: { id: "int-2", name: "acme-claude", ready: true },
+        telegram: { id: "int-3", name: "acme-telegram", ready: true },
+      },
+    });
+
+    expect(canvasYaml).not.toContain("{{ install_params.");
+    expect(canvasYaml).toContain("acme/hire");
+    expect(canvasYaml).toContain("name: acme-telegram");
+    expect(canvasYaml).toMatch(/credentials:[\s\S]*name: acme-claude/);
+  });
+
+  it("takes its Claude credential from the integration, never a bare secret", () => {
+    const definition = getFactoryDefinition("contribution-onboarding");
+    const doc = yaml.load(definition.canvasYaml) as { spec?: { nodes?: CanvasNode[] } };
+    const node = doc.spec?.nodes?.find((candidate) => candidate.component === "runnerClaudeCode");
+    const credentials = node?.configuration?.credentials as { source?: string } | undefined;
+
+    // A secret-sourced credential is handed to the runner as ANTHROPIC_API_KEY, so a
+    // Claude Code subscription token would arrive in the wrong variable and the CLI
+    // would refuse it. Only the integration path picks the variable by credential type.
+    expect(credentials?.source).toBe("integration");
+  });
+
+  it("never uses exit in a step, because steps are sourced into one shell", () => {
+    const offenders = contributionOnboardingSteps()
+      .filter((step) => step.type === "bash")
+      .filter((step) => /(^|[;&|\s])exit\s+\d/.test(step.command ?? ""))
+      .map((step) => step.name);
+
+    expect(offenders).toEqual([]);
+  });
+
+  it("ends on a prompt step, whose reply is the result the notification reads", () => {
+    const steps = contributionOnboardingSteps();
+    expect(steps[steps.length - 1]?.type).toBe("prompt");
   });
 });
