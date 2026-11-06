@@ -11,6 +11,10 @@ export function isVelocityPath(pathname: string): boolean {
   return pathname.includes("/velocity");
 }
 
+export function isAutomationsPath(pathname: string): boolean {
+  return pathname.includes("/automations");
+}
+
 function workspacePageSegment(pathname: string): string | undefined {
   const segments = pathname.split("/");
   const workspacesIndex = segments.lastIndexOf("workspaces");

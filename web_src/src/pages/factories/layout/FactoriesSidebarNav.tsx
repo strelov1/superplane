@@ -1,10 +1,16 @@
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { ChartLine, Cpu, Home } from "lucide-react";
+import { ChartLine, Cpu, Home, Workflow } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Link, useLocation } from "react-router";
-import { factoryAgentPath, factoryHomePath, factoryVelocityPath } from "../lib/factoryPagePaths";
-import { factoriesRailControlClassName, isAgentPath, isBoardPath, isVelocityPath } from "./factoriesRail";
+import { automationsPath, factoryAgentPath, factoryHomePath, factoryVelocityPath } from "../lib/factoryPagePaths";
+import {
+  factoriesRailControlClassName,
+  isAgentPath,
+  isAutomationsPath,
+  isBoardPath,
+  isVelocityPath,
+} from "./factoriesRail";
 
 interface FactoriesSidebarNavProps {
   organizationId: string;
@@ -54,7 +60,9 @@ function RailNavLink({
 }
 
 /**
- * Icon rail under the workspace switcher: the line board, Agent, and Velocity.
+ * Icon rail under the workspace switcher: the line board, Agent, Automations, and Velocity.
+ * Automations is the only way in to automations not attached to a board column
+ * (schedule or webhook triggered); they have no entry on the board.
  * Workspace settings open from the workspace switcher.
  */
 export function FactoriesSidebarNav({
@@ -68,6 +76,7 @@ export function FactoriesSidebarNav({
   const boardHref = factoryHomePath(organizationId, factoryKey, lineId);
   const agentHref = factoryAgentPath(organizationId, factoryKey);
   const velocityHref = factoryVelocityPath(organizationId, factoryKey);
+  const automationsHref = automationsPath(organizationId, factoryKey);
 
   return (
     <nav className="flex flex-col items-center gap-1 px-1.5" aria-label="Workspace" data-testid="factories-sidebar-nav">
@@ -85,6 +94,15 @@ export function FactoriesSidebarNav({
           Icon={Cpu}
           testId="factories-nav-agent"
           isCurrent={isAgentPath(pathname)}
+        />
+      ) : null}
+      {showAgent ? (
+        <RailNavLink
+          to={automationsHref}
+          label="Automations"
+          Icon={Workflow}
+          testId="factories-nav-automations"
+          isCurrent={isAutomationsPath(pathname)}
         />
       ) : null}
       {showVelocity ? (

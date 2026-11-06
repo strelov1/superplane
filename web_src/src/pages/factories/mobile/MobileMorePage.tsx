@@ -27,6 +27,7 @@ import {
   MessageSquare,
   Settings,
   Shield,
+  Workflow,
 } from "lucide-react";
 import type { FactoriesFactoryLine } from "@/api-client";
 import { useId, useMemo, useState, type ReactNode } from "react";
@@ -35,6 +36,7 @@ import { Link, useLocation } from "react-router";
 import { useFactoriesLayout } from "../layout/factoriesLayoutContext";
 import { initialsForName, isWorkspaceAgentNavVisible } from "../layout/factoriesRail";
 import {
+  automationsPath,
   factoryAgentPath,
   factorySettingsPath,
   factorySettingsSectionPath,
@@ -99,6 +101,11 @@ export function MobileMorePage() {
         {showAgent ? (
           <MoreLink href={factoryAgentPath(organizationId, routeSegment)} icon={<Cpu />}>
             Agent
+          </MoreLink>
+        ) : null}
+        {showAgent ? (
+          <MoreLink href={automationsPath(organizationId, routeSegment)} icon={<Workflow />}>
+            Automations
           </MoreLink>
         ) : null}
         <MoreLink href={factorySettingsPath(organizationId, routeSegment)} icon={<Settings />}>
