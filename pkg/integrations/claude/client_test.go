@@ -409,3 +409,48 @@ func Test__Client__GetMessageBatchResults__emptyID(t *testing.T) {
 	_, err := client.GetMessageBatchResults("")
 	require.Error(t, err)
 }
+
+func TestClient_AuthHeader(t *testing.T) {
+	tests := []struct {
+		name          string
+		token         string
+		expectedKey   string
+		expectedValue string
+		emptyHeader   string
+	}{
+		{
+			name:          "API key uses x-api-key",
+			token:         "sk-ant-api03-secret",
+			expectedKey:   "x-api-key",
+			expectedValue: "sk-ant-api03-secret",
+			emptyHeader:   "Authorization",
+		},
+		{
+			name:          "OAuth token uses bearer authorization",
+			token:         "sk-ant-oat01-secret",
+			expectedKey:   "Authorization",
+			expectedValue: "Bearer sk-ant-oat01-secret",
+			emptyHeader:   "x-api-key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			httpCtx := &contexts.HTTPContext{
+				Responses: []*http.Response{{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"data":[]}`)),
+				}},
+			}
+			client := &Client{APIKey: tt.token, BaseURL: defaultBaseURL, http: httpCtx}
+
+			_, err := client.ListModels()
+			require.NoError(t, err)
+			require.Len(t, httpCtx.Requests, 1)
+
+			sent := httpCtx.Requests[0]
+			assert.Equal(t, tt.expectedValue, sent.Header.Get(tt.expectedKey))
+			assert.Empty(t, sent.Header.Get(tt.emptyHeader))
+		})
+	}
+}
