@@ -13,7 +13,7 @@ import {
   REFUND_FACTORY,
 } from "../__fixtures__/factoryPageResponses";
 import { FactoriesLayoutContext } from "../layout/factoriesLayoutContext";
-import { factoryAgentPath } from "../lib/factoryPagePaths";
+import { automationsPath, factoryAgentPath } from "../lib/factoryPagePaths";
 import { MobileMorePage } from "./MobileMorePage";
 
 let permissionsLoading = false;
@@ -107,6 +107,15 @@ describe("MobileMorePage", () => {
     );
   });
 
+  it("opens Automations when the user can update factories", () => {
+    renderMore();
+
+    expect(screen.getByRole("link", { name: "Automations" })).toHaveAttribute(
+      "href",
+      automationsPath("org-1", PRIMARY_FACTORY_ROUTE_SEGMENT),
+    );
+  });
+
   it("hides Agent while permissions load", () => {
     permissionsLoading = true;
     renderMore();
@@ -119,6 +128,7 @@ describe("MobileMorePage", () => {
     renderMore();
 
     expect(screen.queryByRole("link", { name: "Agent" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Automations" })).not.toBeInTheDocument();
   });
 
   it("shows Billing when product billing is on", () => {

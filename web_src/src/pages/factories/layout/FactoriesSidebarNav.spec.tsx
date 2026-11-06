@@ -4,7 +4,7 @@ import { describe, expect, it } from "bun:test";
 
 import { TooltipProvider } from "@/ui/tooltip";
 import { FACTORIES_ORGANIZATION_ID, REFUND_FACTORY, REFUND_LINE_PLAN_ID } from "../__fixtures__/factoryPageResponses";
-import { factoryAgentPath, factoryHomePath, factoryVelocityPath } from "../lib/factoryPagePaths";
+import { automationsPath, factoryAgentPath, factoryHomePath, factoryVelocityPath } from "../lib/factoryPagePaths";
 import { FactoriesSidebarNav } from "./FactoriesSidebarNav";
 
 function renderNav(path: string, { showAgent = false }: { showAgent?: boolean } = {}) {
@@ -44,9 +44,10 @@ describe("FactoriesSidebarNav", () => {
     expect(screen.getByTestId("factories-nav-board").querySelector(".lucide-house")).toBeInTheDocument();
     expect(screen.getByTestId("factories-nav-velocity").querySelector(".lucide-chart-line")).toBeInTheDocument();
     expect(screen.queryByTestId("factories-nav-agent")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("factories-nav-automations")).not.toBeInTheDocument();
   });
 
-  it("places Agent between Board and Velocity", () => {
+  it("places Agent and Automations between Board and Velocity", () => {
     renderNav(`/${org}/workspaces/${key}/lines/${REFUND_LINE_PLAN_ID}`, { showAgent: true });
 
     const links = [...screen.getByTestId("factories-sidebar-nav").querySelectorAll("a")].map((node) =>
@@ -54,10 +55,25 @@ describe("FactoriesSidebarNav", () => {
     );
     const agentLink = screen.getByTestId("factories-nav-agent");
 
-    expect(links).toEqual(["factories-nav-board", "factories-nav-agent", "factories-nav-velocity"]);
+    expect(links).toEqual([
+      "factories-nav-board",
+      "factories-nav-agent",
+      "factories-nav-automations",
+      "factories-nav-velocity",
+    ]);
     expect(agentLink).toHaveAttribute("aria-label", "Agent");
     expect(agentLink).toHaveAttribute("href", factoryAgentPath(org, key));
     expect(agentLink.querySelector(".lucide-cpu")).toBeInTheDocument();
+    const automationsLink = screen.getByTestId("factories-nav-automations");
+    expect(automationsLink).toHaveAttribute("aria-label", "Automations");
+    expect(automationsLink).toHaveAttribute("href", automationsPath(org, key));
+  });
+
+  it("marks the Automations icon current on the automations pages", () => {
+    renderNav(`/${org}/workspaces/${key}/automations/some-canvas`, { showAgent: true });
+
+    expect(screen.getByTestId("factories-nav-automations")).toHaveAttribute("aria-current", "page");
+    expect(screen.getByTestId("factories-nav-board")).not.toHaveAttribute("aria-current");
   });
 
   it("marks the Board icon current on the line board", () => {
