@@ -150,6 +150,18 @@ func Tools() []Tool {
 			},
 		},
 		{
+			Name:        "link_pull_request",
+			Description: "Attach an open pull request that was opened outside SuperPlane (by hand or by another agent) to an existing task. Then PR feedback, checks and PR Closure work on it, and merging it closes the task. Call it right after opening a pull request for a task by hand. A pull request belongs to one task only.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"task":             map[string]any{"type": "string", "description": "Task id, number, or key."},
+					"pull_request_url": map[string]any{"type": "string", "description": "Open pull request URL (GitHub or Bitbucket) in the task's repository."},
+				},
+				"required": []string{"task", "pull_request_url"},
+			},
+		},
+		{
 			Name:        "assign_task",
 			Description: "Set or clear the owner of an existing task. assignee is an email, a GitHub login, or a user id. Set unassign to true to clear every owner. Set one of those values, not both.",
 			InputSchema: map[string]any{
@@ -219,6 +231,8 @@ func (rt *Runtime) CallTool(ctx context.Context, claims *AccessClaims, name stri
 		return rt.createTask(ctx, claims, args)
 	case "hand_off_task":
 		return rt.handOffTask(ctx, claims, args)
+	case "link_pull_request":
+		return rt.linkPullRequest(ctx, claims, args)
 	case "assign_task":
 		return rt.assignTask(ctx, claims, args)
 	case "list_members":
@@ -526,6 +540,35 @@ func (rt *Runtime) handOffTask(ctx context.Context, claims *AccessClaims, args m
 		payload["pull_request_url"] = result.PullRequestURL
 	}
 	return TextResult(mustJSON(payload)), nil
+}
+
+func (rt *Runtime) linkPullRequest(ctx context.Context, claims *AccessClaims, args map[string]any) (ToolResult, error) {
+	factoryID, err := rt.beginWorkspaceCall(ctx, claims, args, "work_orders:update")
+	if err != nil {
+		return ToolResult{}, err
+	}
+	task, err := stringArg(args, "task")
+	if err != nil {
+		return ToolResult{}, err
+	}
+	pullRequestURL, err := stringArg(args, "pull_request_url")
+	if err != nil {
+		return ToolResult{}, err
+	}
+	orderID, err := resolveTaskID(ctx, claims, factoryID, task)
+	if err != nil {
+		return ToolResult{}, err
+	}
+	linked, err := factories.LinkWorkOrderPullRequest(toolContext(ctx, claims), rt.Intake, claims.OrgID.String(), factoryID.String(), orderID, pullRequestURL)
+	if err != nil {
+		return ToolResult{}, actionError(err)
+	}
+	return TextResult(mustJSON(map[string]any{
+		"task_id":          orderID,
+		"pull_request_url": linked.URL,
+		"number":           linked.Number,
+		"state":            linked.State,
+	})), nil
 }
 
 func (rt *Runtime) assignTask(ctx context.Context, claims *AccessClaims, args map[string]any) (ToolResult, error) {
