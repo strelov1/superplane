@@ -17,6 +17,9 @@ import (
 )
 
 const (
+	// oauthTokenPrefix marks a Claude Code OAuth token, which the API rejects on
+	// x-api-key and expects as a bearer token instead.
+	oauthTokenPrefix      = "sk-ant-oat"
 	defaultBaseURL        = "https://api.anthropic.com/v1"
 	anthropicVersionValue = "2023-06-01"
 	// anthropicFilesBeta is required to fetch files that server tools
@@ -247,6 +250,18 @@ func (c *Client) doRequest(method, URL string, body io.Reader, apiKey, beta stri
 	return c.doRequestCtx(context.Background(), method, URL, body, apiKey, beta)
 }
 
+// setAuthHeader picks the header the credential is valid for. OAuth tokens only
+// authenticate against inference endpoints, so actions beyond Text Prompt still
+// fail with the API's own scope error.
+func setAuthHeader(req *http.Request, token string) {
+	if strings.HasPrefix(token, oauthTokenPrefix) {
+		req.Header.Set("Authorization", "Bearer "+token)
+		return
+	}
+
+	req.Header.Set("x-api-key", token)
+}
+
 func (c *Client) doRequestCtx(ctx context.Context, method, URL string, body io.Reader, apiKey, beta string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, method, URL, body)
 	if err != nil {
@@ -255,7 +270,7 @@ func (c *Client) doRequestCtx(ctx context.Context, method, URL string, body io.R
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("x-api-key", apiKey)
+	setAuthHeader(req, apiKey)
 	req.Header.Set("anthropic-version", anthropicVersionValue)
 	if beta != "" {
 		req.Header.Set("anthropic-beta", beta)

@@ -9,7 +9,12 @@ import (
 
 const (
 	integrationSecretAnthropicAPIKey = "ANTHROPIC_API_KEY"
-	claudeSecretUsage                = `An Anthropic API key is available in the ANTHROPIC_API_KEY environment variable.
+	// Claude Code reads a subscription token from this variable. The same token
+	// in ANTHROPIC_API_KEY is rejected as an invalid key.
+	integrationSecretClaudeCodeOAuthToken = "CLAUDE_CODE_OAUTH_TOKEN"
+	claudeOAuthSecretUsage                = `A Claude Code OAuth token is available in the CLAUDE_CODE_OAUTH_TOKEN environment variable.
+Do not print the token.`
+	claudeSecretUsage = `An Anthropic API key is available in the ANTHROPIC_API_KEY environment variable.
 Do not print the key.`
 )
 
@@ -22,6 +27,15 @@ func (i *Claude) ResolveSecrets(ctx core.IntegrationSecretContext) (core.Integra
 	key := strings.TrimSpace(string(apiKey))
 	if key == "" {
 		return core.IntegrationSecrets{}, fmt.Errorf("apiKey is required")
+	}
+
+	if strings.HasPrefix(key, oauthTokenPrefix) {
+		return core.IntegrationSecrets{
+			Values: map[string][]byte{
+				integrationSecretClaudeCodeOAuthToken: []byte(key),
+			},
+			Usage: claudeOAuthSecretUsage,
+		}, nil
 	}
 
 	return core.IntegrationSecrets{
