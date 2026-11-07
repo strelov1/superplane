@@ -282,9 +282,30 @@ func (t *Telegram) handleCallbackQuery(ctx core.HTTPRequestContext, update Updat
 	chatID := query.Message.Chat.ID
 	chatIDStr := strconv.FormatInt(chatID, 10)
 
+	// Every click is answered: an unanswered callback leaves the button spinning in
+	// Telegram, which reads as "the button does nothing".
+	client, clientErr := NewClient(ctx.Integration)
+	if clientErr != nil {
+		ctx.Logger.Errorf("error creating Telegram client: %v", clientErr)
+	}
+	reply := func(text string, closeQuestion bool) {
+		if client == nil {
+			return
+		}
+		if err := client.AnswerCallbackQuery(query.ID, text); err != nil {
+			ctx.Logger.Errorf("error answering callback query: %v", err)
+		}
+		if closeQuestion {
+			if err := client.RemoveInlineKeyboard(chatIDStr, messageID); err != nil {
+				ctx.Logger.Errorf("error removing inline keyboard: %v", err)
+			}
+		}
+	}
+
 	subscriptions, err := ctx.Integration.ListSubscriptions()
 	if err != nil {
 		ctx.Logger.Errorf("error listing subscriptions: %v", err)
+		reply("Could not record the answer, try again", false)
 		ctx.Response.WriteHeader(500)
 		return
 	}
@@ -313,7 +334,9 @@ func (t *Telegram) handleCallbackQuery(ctx core.HTTPRequestContext, update Updat
 		}
 	}
 
+	// No waiting execution: the question was already answered or timed out.
 	if matchedSubscription == nil {
+		reply("This question is no longer waiting for an answer", true)
 		ctx.Response.WriteHeader(200)
 		return
 	}
@@ -323,6 +346,7 @@ func (t *Telegram) handleCallbackQuery(ctx core.HTTPRequestContext, update Updat
 	executionID, err := uuid.Parse(executionIDStr)
 	if err != nil {
 		ctx.Logger.Errorf("error parsing execution ID: %v", err)
+		reply("This question is no longer waiting for an answer", true)
 		ctx.Response.WriteHeader(200)
 		return
 	}
@@ -337,21 +361,12 @@ func (t *Telegram) handleCallbackQuery(ctx core.HTTPRequestContext, update Updat
 
 	if err := t.createButtonClickAction(executionID, query.Data, clickedBy); err != nil {
 		ctx.Logger.Errorf("error creating button click action: %v", err)
+		reply("Could not record the answer, try again", false)
 		ctx.Response.WriteHeader(500)
 		return
 	}
 
-	client, err := NewClient(ctx.Integration)
-	if err != nil {
-		ctx.Logger.Errorf("error creating Telegram client: %v", err)
-		ctx.Response.WriteHeader(200)
-		return
-	}
-
-	if err := client.AnswerCallbackQuery(query.ID); err != nil {
-		ctx.Logger.Errorf("error answering callback query: %v", err)
-	}
-
+	reply("Answer received: "+query.Message.buttonLabel(query.Data), true)
 	ctx.Response.WriteHeader(200)
 }
 
@@ -389,8 +404,30 @@ type Update struct {
 type CallbackQuery struct {
 	ID      string           `json:"id"`
 	From    *User            `json:"from,omitempty"`
-	Message *TelegramMessage `json:"message,omitempty"`
+	Message *CallbackMessage `json:"message,omitempty"`
 	Data    string           `json:"data"`
+}
+
+// CallbackMessage is the message a clicked button sits on; its keyboard names the button.
+type CallbackMessage struct {
+	TelegramMessage
+	ReplyMarkup *struct {
+		InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
+	} `json:"reply_markup,omitempty"`
+}
+
+// buttonLabel returns the text of the button carrying data, or data itself.
+func (m *CallbackMessage) buttonLabel(data string) string {
+	if m.ReplyMarkup != nil {
+		for _, row := range m.ReplyMarkup.InlineKeyboard {
+			for _, b := range row {
+				if b.CallbackData == data {
+					return b.Text
+				}
+			}
+		}
+	}
+	return data
 }
 
 type TelegramMessage struct {

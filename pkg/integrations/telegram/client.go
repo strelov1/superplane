@@ -179,10 +179,14 @@ func (c *Client) SendMessageWithInlineKeyboard(chatID string, text string, butto
 	return &message, nil
 }
 
-// AnswerCallbackQuery acknowledges a callback query from an inline button click
-func (c *Client) AnswerCallbackQuery(callbackQueryID string) error {
+// AnswerCallbackQuery acknowledges a callback query from an inline button click.
+// The text, when set, is shown to the person who clicked as a short notice.
+func (c *Client) AnswerCallbackQuery(callbackQueryID string, text string) error {
 	payload := map[string]string{
 		"callback_query_id": callbackQueryID,
+	}
+	if text != "" {
+		payload["text"] = text
 	}
 
 	body, err := json.Marshal(payload)
@@ -191,6 +195,22 @@ func (c *Client) AnswerCallbackQuery(callbackQueryID string) error {
 	}
 
 	_, err = c.doRequest(http.MethodPost, "/answerCallbackQuery", bytes.NewReader(body))
+	return err
+}
+
+// RemoveInlineKeyboard takes the buttons off a message, so an answered question
+// no longer looks like it is waiting.
+func (c *Client) RemoveInlineKeyboard(chatID string, messageID int64) error {
+	body, err := json.Marshal(map[string]any{
+		"chat_id":      chatID,
+		"message_id":   messageID,
+		"reply_markup": map[string]any{"inline_keyboard": [][]InlineKeyboardButton{}},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	_, err = c.doRequest(http.MethodPost, "/editMessageReplyMarkup", bytes.NewReader(body))
 	return err
 }
 
