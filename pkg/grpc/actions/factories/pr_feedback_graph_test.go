@@ -310,7 +310,9 @@ func Test__BuildPRFeedbackCanvas(t *testing.T) {
 
 		prompt := prFeedbackPrompt()
 		assert.Contains(t, prompt, "Explain disagreements in the completion comment.")
-		assert.Contains(t, prompt, "Post one pull request comment after you address all feedback.")
+		assert.Contains(t, prompt, "If you changed code, post one pull request comment after you address all feedback. If nothing changed, post no comment at all.")
+		assert.Contains(t, prompt, "Never start a line with @superplaneagent in anything you post")
+		assert.Contains(t, prompt, "Verify every finding against the current code before you change anything.")
 		assert.Contains(t, prompt, "Summarize the changes in this comment.")
 		assert.Contains(t, prompt, "If you upload visual evidence, include it in the same comment.")
 		assert.Contains(t, prompt, "Do not post a separate visual evidence comment.")

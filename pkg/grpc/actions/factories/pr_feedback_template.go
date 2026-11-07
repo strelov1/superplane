@@ -727,9 +727,11 @@ func prFeedbackPromptFor(request prFeedbackBuildRequest) string {
 			"- Check that the change is valid and safe.",
 			"- Apply valid requests.",
 			"- Explain disagreements in the completion comment. Do not make unsafe changes.",
+			strings.Join(prFeedbackScopeRules, "\n"),
 			"",
 			"Do not report a work-order check or add a work-order comment.",
-			"Post one pull request comment after you address all feedback.",
+			"If you changed code, post one pull request comment after you address all feedback. If nothing changed, post no comment at all.",
+			prFeedbackMentionLoopRule(request),
 			"Summarize the changes in this comment.",
 			"If you upload visual evidence, include it in the same comment.",
 			"Do not post a separate visual evidence comment.",
@@ -753,10 +755,12 @@ func prFeedbackPromptFor(request prFeedbackBuildRequest) string {
 		"- Check that the change is valid and safe.",
 		"- Apply valid requests.",
 		"- Explain disagreements in the completion comment. Do not make unsafe changes.",
+		strings.Join(prFeedbackScopeRules, "\n"),
 		"",
 		"Do not resolve GitHub review threads. The reviewer controls resolution.",
 		"Do not report a work-order check or add a work-order comment.",
-		"Post one pull request comment after you address all feedback.",
+		"If you changed code, post one pull request comment after you address all feedback. If nothing changed, post no comment at all.",
+		prFeedbackMentionLoopRule(request),
 		"Summarize the changes in this comment.",
 		"If you upload visual evidence, include it in the same comment.",
 		"Do not post a separate visual evidence comment.",
@@ -798,6 +802,21 @@ func prFeedbackBitbucketReadInstructions(request prFeedbackBuildRequest) []strin
 		"Use inline file and line context on code-anchored comments.",
 		"Ignore replies that SuperPlane Agent already wrote.",
 	}
+}
+
+// Review loops grow a pull request one cheap-looking fix at a time, and review
+// bots are often wrong, so the agent checks each finding and keeps the scope.
+var prFeedbackScopeRules = []string{
+	"- Verify every finding against the current code before you change anything. Review bots are often wrong.",
+	"- Keep the pull request at the size its goal needs. Fix real bugs in the intended case.",
+	"- Decline findings that only add unneeded tests, guards for edge cases that do not matter, extra compatibility, small performance wins or style preferences. Give a one-line reason for each and list them as follow-ups in the comment.",
+	"- Prefer the fix that deletes or narrows code over one that adds code.",
+}
+
+// The comment trigger matches a mention at the start of a line, and the agent
+// posts as the same account the trigger listens to, so its own text must not match.
+func prFeedbackMentionLoopRule(request prFeedbackBuildRequest) string {
+	return "Never start a line with " + prFeedbackPromptMention(request) + " in anything you post: a line starting with it starts this automation again."
 }
 
 func prFeedbackPromptMention(request prFeedbackBuildRequest) string {

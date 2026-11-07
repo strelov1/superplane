@@ -303,6 +303,13 @@ func prFeedbackBitbucketCommitPushStep() map[string]any {
 	}
 }
 
+// A red check is not always this branch's fault, and the cheapest way to turn it
+// green is to weaken it; both cost more than they save.
+var prFeedbackChecksCauseRules = []string{
+	"Read the log before you change code. Tell a failure in this branch from one outside it: a runner that died, a network or registry error, a rate limit, a timeout.",
+	"Fix the cause. Never make a check pass by skipping, deleting or loosening a test, a lint rule or a threshold.",
+}
+
 func prFeedbackChecksPrompt(request prFeedbackBuildRequest) string {
 	if prFeedbackVCSProvider(request) == models.ProviderBitbucket {
 		return strings.Join([]string{
@@ -319,6 +326,7 @@ func prFeedbackChecksPrompt(request prFeedbackBuildRequest) string {
 			"Read logs from Bitbucket Pipelines or from the build URL in FAILED_CHECKS.",
 			"Use the Bitbucket token in BITBUCKET_TOKEN.",
 			"When BITBUCKET_EMAIL is set, send HTTP basic authentication with that email and BITBUCKET_TOKEN.",
+			strings.Join(prFeedbackChecksCauseRules, "\n"),
 			"",
 			"Verify the remote pull request head before you push.",
 			"Stop without pushing when the remote head differs from this revision.",
@@ -340,6 +348,8 @@ func prFeedbackChecksPrompt(request prFeedbackBuildRequest) string {
 		"Address every failed check in that list in this run.",
 		"Read logs from GitHub or from an available external integration.",
 		"Use the GitHub token in GITHUB_TOKEN.",
+		strings.Join(prFeedbackChecksCauseRules, "\n"),
+		"Re-run a check that failed outside this branch with `gh run rerun <run-id> --failed` and change no code for it.",
 		"",
 		"Verify the remote pull request head before you push.",
 		"Stop without pushing when the remote head differs from this revision.",
