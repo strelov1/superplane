@@ -43,11 +43,6 @@ func DispatchWorkOrder(ctx context.Context, organizationID string, req *pb.Dispa
 		runKind = "rerun"
 	}
 
-	lineName := strings.TrimSpace(req.GetLineName())
-	if lineName == "" {
-		return nil, factoryErrorToStatus(invalidArgument("line_name is required"), "failed to dispatch work order")
-	}
-
 	var actor *uuid.UUID
 	if userIDStr, ok := authentication.GetUserIdFromMetadata(ctx); ok {
 		parsed, err := uuid.Parse(userIDStr)
@@ -56,7 +51,8 @@ func DispatchWorkOrder(ctx context.Context, organizationID string, req *pb.Dispa
 		}
 	}
 
-	line, err := resolvedFactory.FindLineByName(db, lineName)
+	// An empty line name picks the workspace's only line, as hand-off does.
+	line, err := resolveHandOffLine(db, resolvedFactory, req.GetLineName())
 	if err != nil {
 		return nil, factoryErrorToStatus(err, "failed to dispatch work order")
 	}

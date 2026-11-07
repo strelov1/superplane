@@ -93,7 +93,7 @@ func Tools() []Tool {
 		},
 		{
 			Name:        "list_task_artifacts",
-			Description: "List artifacts on a task. File artifacts include a public download URL. The response does not include file bytes.",
+			Description: "List artifacts on a task. A markdown artifact includes its body, so the refinement plan (plan.md) is readable here. File artifacts include a public download URL. The response does not include file bytes.",
 			InputSchema: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{"task": map[string]any{"type": "string", "description": "Task id, number, or key."}},
@@ -159,6 +159,18 @@ func Tools() []Tool {
 					"pull_request_url": map[string]any{"type": "string", "description": "Open pull request URL (GitHub or Bitbucket) in the task's repository."},
 				},
 				"required": []string{"task", "pull_request_url"},
+			},
+		},
+		{
+			Name:        "dispatch_task",
+			Description: "Start an existing task on a line, the same as Start on its board card: a refined draft moves to Implement and its agent starts. Read the plan with list_task_artifacts first. It does not wait for the agent.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"task": map[string]any{"type": "string", "description": "Task id, number, or key."},
+					"line": map[string]any{"type": "string", "description": "Line name. Required when the workspace has more than one line."},
+				},
+				"required": []string{"task"},
 			},
 		},
 		{
@@ -233,6 +245,8 @@ func (rt *Runtime) CallTool(ctx context.Context, claims *AccessClaims, name stri
 		return rt.handOffTask(ctx, claims, args)
 	case "link_pull_request":
 		return rt.linkPullRequest(ctx, claims, args)
+	case "dispatch_task":
+		return rt.dispatchTask(ctx, claims, args)
 	case "assign_task":
 		return rt.assignTask(ctx, claims, args)
 	case "list_members":
@@ -384,6 +398,9 @@ func (rt *Runtime) listTaskArtifacts(ctx context.Context, claims *AccessClaims, 
 			}
 			if filename, _ := fields["filename"].(string); filename != "" {
 				row["filename"] = filename
+			}
+			if body, _ := fields["body"].(string); body != "" {
+				row["body"] = body
 			}
 		}
 		artifacts = append(artifacts, row)
@@ -568,6 +585,36 @@ func (rt *Runtime) linkPullRequest(ctx context.Context, claims *AccessClaims, ar
 		"pull_request_url": linked.URL,
 		"number":           linked.Number,
 		"state":            linked.State,
+	})), nil
+}
+
+func (rt *Runtime) dispatchTask(ctx context.Context, claims *AccessClaims, args map[string]any) (ToolResult, error) {
+	factoryID, err := rt.beginWorkspaceCall(ctx, claims, args, "work_orders:update")
+	if err != nil {
+		return ToolResult{}, err
+	}
+	task, err := stringArg(args, "task")
+	if err != nil {
+		return ToolResult{}, err
+	}
+	line, _ := args["line"].(string)
+	orderID, err := resolveTaskID(ctx, claims, factoryID, task)
+	if err != nil {
+		return ToolResult{}, err
+	}
+	resp, err := factories.DispatchWorkOrder(toolContext(ctx, claims), claims.OrgID.String(), &pb.DispatchWorkOrderRequest{
+		FactoryId: factoryID.String(),
+		OrderId:   orderID,
+		LineName:  strings.TrimSpace(line),
+	})
+	if err != nil {
+		return ToolResult{}, actionError(err)
+	}
+	order := resp.GetOrder()
+	return TextResult(mustJSON(map[string]any{
+		"id":    order.GetId(),
+		"key":   order.GetKey(),
+		"state": protoStateName(order.GetState()),
 	})), nil
 }
 

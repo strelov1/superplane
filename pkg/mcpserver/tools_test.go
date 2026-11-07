@@ -153,6 +153,38 @@ func TestHandOffTaskReturnsOpenImplementTask(t *testing.T) {
 	require.NotEmpty(t, payload["key"])
 }
 
+func TestDispatchTaskStartsDraftOnOnlyLine(t *testing.T) {
+	r := support.Setup(t)
+	enableFactories(t, r.Organization.ID)
+	ctx := t.Context()
+	db := database.DB(ctx)
+
+	factoryModel, err := models.CreateFactory(db, r.Organization.ID, "MCP Dispatch", "", "DSP")
+	require.NoError(t, err)
+	app, entry := support.CreateFactoryAppWithOnRunTrigger(t, r, factoryModel.ID, "implement", "start-impl")
+	_, err = factoryModel.CreateLine(db, "ship", []models.FactoryLineStep{
+		{Type: models.FactoryLineStepTypeRunApp, AppID: app.ID, Entrypoint: entry},
+	})
+	require.NoError(t, err)
+	order, err := factoryModel.CreateWorkOrder(db, "Refined draft", "", &r.User, nil, nil)
+	require.NoError(t, err)
+
+	runtime := &Runtime{Auth: r.AuthService}
+	result, err := runtime.CallTool(ctx, toolClaims(r, factoryModel.ID), "dispatch_task", map[string]any{
+		"task": order.ID.String(),
+	})
+	require.NoError(t, err)
+	payload := decodeToolJSON(t, result)
+	assert.Equal(t, order.ID.String(), payload["id"])
+	assert.Equal(t, "open", payload["state"])
+
+	_, err = runtime.CallTool(ctx, toolClaims(r, factoryModel.ID), "dispatch_task", map[string]any{
+		"task": order.ID.String(),
+		"line": "no-such-line",
+	})
+	require.Error(t, err)
+}
+
 func TestCallToolSucceedsWithoutMCPServerFlag(t *testing.T) {
 	r := support.Setup(t)
 	require.NoError(t, models.EnableExperimentalFeature(r.Organization.ID, features.FeatureFactories))
@@ -221,6 +253,37 @@ func TestListTaskArtifactsIncludesDownloadURL(t *testing.T) {
 	assert.Equal(t, "file", row["type"])
 	assert.Equal(t, "notes.png", row["filename"])
 	assert.Contains(t, row["url"], "/api/v1/public/artifacts/")
+}
+
+func TestListTaskArtifactsIncludesMarkdownBody(t *testing.T) {
+	r := support.Setup(t)
+	enableFactories(t, r.Organization.ID)
+	ctx := t.Context()
+	db := database.DB(ctx)
+
+	factoryModel, err := models.CreateFactory(db, r.Organization.ID, "MCP Plan", "", "PLN")
+	require.NoError(t, err)
+	order, err := factoryModel.CreateWorkOrder(db, "Has plan", "", &r.User, nil, nil)
+	require.NoError(t, err)
+	_, err = order.CreateArtifact(db, models.FactoryWorkOrderArtifactParams{
+		Type:      models.FactoryWorkOrderArtifactTypeMarkdown,
+		CreatedBy: &r.User,
+		Data:      map[string]any{"title": "plan.md", "body": "# Plan\n\nDo the thing."},
+	})
+	require.NoError(t, err)
+
+	runtime := &Runtime{Auth: r.AuthService}
+	result, err := runtime.CallTool(ctx, toolClaims(r, factoryModel.ID), "list_task_artifacts", map[string]any{
+		"task": order.ID.String(),
+	})
+	require.NoError(t, err)
+	artifacts, ok := decodeToolJSON(t, result)["artifacts"].([]any)
+	require.True(t, ok)
+	require.Len(t, artifacts, 1)
+	row, ok := artifacts[0].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "plan.md", row["title"])
+	assert.Equal(t, "# Plan\n\nDo the thing.", row["body"])
 }
 
 func TestGetTaskAgentWithoutSessionReturnsToolError(t *testing.T) {
