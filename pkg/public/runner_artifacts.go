@@ -10,6 +10,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -78,8 +79,13 @@ func (s *Server) handleRunnerArtifactUpload(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// A standalone canvas run has no work order: its file belongs to the organization.
+	fileScope := blob.ScopeTask
+	if artifactContext.Order == nil {
+		fileScope = blob.ScopeOrganization
+	}
 	file, err := models.CreatePendingFile(db, models.CreateFileParams{
-		Scope:          blob.ScopeTask,
+		Scope:          fileScope,
 		OrganizationID: scope.OrganizationID,
 		FactoryID:      scope.FactoryID,
 		WorkOrderID:    scope.WorkOrderID,
@@ -137,6 +143,9 @@ func (s *Server) handleRunnerArtifactUpload(w http.ResponseWriter, r *http.Reque
 		if readyErr := file.MarkReady(tx, upload.SizeBytes, upload.Checksum); readyErr != nil {
 			return readyErr
 		}
+		if artifactContext.Order == nil {
+			return nil
+		}
 		artifact, err = artifactContext.Order.CreateArtifact(tx, models.FactoryWorkOrderArtifactParams{
 			Type:       models.FactoryWorkOrderArtifactTypeFile,
 			Data:       data,
@@ -152,11 +161,15 @@ func (s *Server) handleRunnerArtifactUpload(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if err := messages.PublishFactoryWorkOrderUpdated(scope.FactoryID.String(), scope.WorkOrderID.String(), factory.EventTypeOrderArtifactAdded); err != nil {
-		log.WithError(err).Warn("failed to publish runner artifact update")
+	artifactID := file.ID
+	if artifact != nil {
+		artifactID = artifact.ID
+		if err := messages.PublishFactoryWorkOrderUpdated(scope.FactoryID.String(), scope.WorkOrderID.String(), factory.EventTypeOrderArtifactAdded); err != nil {
+			log.WithError(err).Warn("failed to publish runner artifact update")
+		}
 	}
 	response := runnerArtifactResponse{
-		ArtifactID:  artifact.ID.String(),
+		ArtifactID:  artifactID.String(),
 		FileID:      file.ID.String(),
 		Filename:    file.Filename,
 		ContentType: file.ContentType,
@@ -167,7 +180,7 @@ func (s *Server) handleRunnerArtifactUpload(w http.ResponseWriter, r *http.Reque
 	logger.WithFields(log.Fields{
 		"content_type": contentType,
 		"file_id":      file.ID,
-		"artifact_id":  artifact.ID,
+		"artifact_id":  artifactID,
 	}).Info("stored runner artifact")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -292,6 +305,9 @@ func loadRunnerArtifactContext(db *gorm.DB, scope *runneraction.ArtifactUploadSc
 		runContext.WorkOrderID != scope.WorkOrderID || runContext.CanvasID != scope.CanvasID {
 		return nil, fmt.Errorf("artifact run context does not match token")
 	}
+	if scope.WorkOrderID == uuid.Nil {
+		return loadStandaloneArtifactContext(db, scope, nodeExecution)
+	}
 	factoryModel, err := models.FindFactory(db, scope.OrganizationID, scope.FactoryID)
 	if err != nil {
 		return nil, err
@@ -323,6 +339,22 @@ func loadRunnerArtifactContext(db *gorm.DB, scope *runneraction.ArtifactUploadSc
 	}, nil
 }
 
+func loadStandaloneArtifactContext(
+	db *gorm.DB,
+	scope *runneraction.ArtifactUploadScope,
+	nodeExecution *models.CanvasNodeExecution,
+) (*runnerArtifactContext, error) {
+	canvas, err := models.FindCanvasWithoutOrgScopeInTransaction(db, scope.CanvasID)
+	if err != nil || canvas.OrganizationID != scope.OrganizationID || canvas.FactoryID != nil {
+		return nil, fmt.Errorf("canvas does not match token")
+	}
+	node, err := models.FindCanvasNode(db, scope.CanvasID, scope.NodeID)
+	if err != nil {
+		return nil, err
+	}
+	return &runnerArtifactContext{Canvas: canvas, Node: node, NodeExecution: nodeExecution}, nil
+}
+
 func artifactAutomationRef(context *runnerArtifactContext) *factory.AutomationRef {
 	ref := &factory.AutomationRef{
 		NodeID:   context.Node.NodeID,
@@ -347,7 +379,13 @@ func artifactPublicURL(file *models.File) (string, error) {
 	if file.PublicID == nil || *file.PublicID == uuid.Nil {
 		return "", fmt.Errorf("artifact public id is missing")
 	}
-	return fmt.Sprintf("%s/api/v1/public/artifacts/%s/%s", blob.PublicBaseURL(), file.PublicID, url.PathEscape(file.Filename)), nil
+	// ARTIFACT_PUBLIC_BASE_URL serves artifacts from a public host when BASE_URL is private
+	// (a link in a GitHub comment must load for everyone).
+	base := strings.TrimRight(strings.TrimSpace(os.Getenv("ARTIFACT_PUBLIC_BASE_URL")), "/")
+	if base == "" {
+		base = blob.PublicBaseURL()
+	}
+	return fmt.Sprintf("%s/api/v1/public/artifacts/%s/%s", base, file.PublicID, url.PathEscape(file.Filename)), nil
 }
 
 func artifactMarkdown(title, contentType, publicURL string) string {

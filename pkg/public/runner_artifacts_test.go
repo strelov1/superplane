@@ -312,6 +312,92 @@ func TestRunnerArtifactUploadFromVisualEvidence(t *testing.T) {
 	assert.ErrorIs(t, err, runneraction.ErrArtifactRunScopeNotFound)
 }
 
+func TestRunnerArtifactUploadFromStandaloneCanvas(t *testing.T) {
+	r := support.Setup(t)
+	defer r.Close()
+
+	t.Setenv("BASE_URL", "http://private.test")
+	t.Setenv("ARTIFACT_PUBLIC_BASE_URL", "https://public.test/")
+	store, err := filesystem.New(t.TempDir())
+	require.NoError(t, err)
+	blob.SetCurrent(store)
+	t.Cleanup(func() { blob.SetCurrent(nil) })
+
+	signer := jwt.NewSigner("test")
+	server := newRunnerArtifactTestServer(t, r, signer)
+	db := database.Conn()
+
+	const nodeID = "ready-check"
+	canvas, _ := support.CreateCanvas(t, r.Organization.ID, r.User, []models.CanvasNode{{
+		NodeID: nodeID,
+		Name:   "Ready check",
+		Type:   models.NodeTypeComponent,
+	}}, nil)
+	rootEvent := support.EmitCanvasEventForNode(t, canvas.ID, nodeID, "default", nil)
+	run, err := models.FindOrCreateCanvasRunForRootEventInTransaction(db, rootEvent)
+	require.NoError(t, err)
+	nodeExecution := createExecutionForCanvasRun(t, run, rootEvent.ID, nodeID)
+
+	runContext, err := runneraction.ResolveArtifactRunContext(db, run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, r.Organization.ID, runContext.OrganizationID)
+	assert.Equal(t, uuid.Nil, runContext.FactoryID)
+	assert.Equal(t, uuid.Nil, runContext.WorkOrderID)
+
+	t.Setenv("JWT_SECRET", "test")
+	environment := runneraction.AttachArtifactUploadEnv(core.ExecutionContext{
+		ID:         nodeExecution.ID,
+		RunID:      run.ID,
+		WorkflowID: canvas.ID.String(),
+		NodeID:     nodeID,
+		BaseURL:    "http://files.test",
+	}, nil, 60, true)
+	var token string
+	for _, variable := range environment {
+		if variable.Name == runneraction.EnvSuperplaneArtifactToken {
+			token = variable.Value
+		}
+	}
+	require.NotEmpty(t, token)
+
+	png := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0}, 16)...)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/runner/artifacts", bytes.NewReader(png))
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", "image/png")
+	request.Header.Set("Content-Disposition", `attachment; filename="after.png"`)
+	response := httptest.NewRecorder()
+	server.Router.ServeHTTP(response, request)
+	require.Equal(t, http.StatusCreated, response.Code, response.Body.String())
+
+	var uploaded runnerArtifactResponse
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &uploaded))
+	assert.Equal(t, uploaded.FileID, uploaded.ArtifactID)
+	publicURL, err := url.Parse(uploaded.PublicURL)
+	require.NoError(t, err)
+	assert.Equal(t, "public.test", publicURL.Host)
+
+	fileID, err := uuid.Parse(uploaded.FileID)
+	require.NoError(t, err)
+	file, err := models.FindFile(db, fileID)
+	require.NoError(t, err)
+	assert.Equal(t, blob.ScopeOrganization, file.Scope)
+	assert.Nil(t, file.FactoryID)
+	assert.Nil(t, file.WorkOrderID)
+	assert.Equal(t, r.Organization.ID, *file.OrganizationID)
+
+	download := httptest.NewRecorder()
+	server.Router.ServeHTTP(download, httptest.NewRequest(http.MethodGet, publicURL.RequestURI(), nil))
+	assert.Equal(t, http.StatusOK, download.Code)
+	assert.Equal(t, png, download.Body.Bytes())
+
+	// A canvas that joins a factory loses the standalone scope.
+	factoryModel, err := models.CreateFactory(db, r.Organization.ID, support.RandomName("factory"), "", "")
+	require.NoError(t, err)
+	require.NoError(t, db.Model(canvas).Update("factory_id", factoryModel.ID).Error)
+	_, err = runneraction.ResolveArtifactRunContext(db, run.ID)
+	assert.ErrorIs(t, err, runneraction.ErrArtifactRunScopeNotFound)
+}
+
 func newRunnerArtifactTestServer(
 	t *testing.T,
 	r *support.ResourceRegistry,

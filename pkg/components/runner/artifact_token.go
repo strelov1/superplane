@@ -46,8 +46,9 @@ type ArtifactRunContext struct {
 }
 
 // ResolveArtifactRunContext accepts factory line runs, registered PR
-// discussion runs, and Verify visual evidence runs. Other factory canvases
-// do not receive artifact access.
+// discussion runs, Verify visual evidence runs, and runs of canvases outside
+// any factory (their artifacts belong to the organization, not a work order).
+// Other factory canvases do not receive artifact access.
 func ResolveArtifactRunContext(tx *gorm.DB, runID uuid.UUID) (*ArtifactRunContext, error) {
 	execution, err := models.FindWorkOrderExecutionForRun(tx, runID)
 	if err == nil {
@@ -79,7 +80,11 @@ func ResolveArtifactRunContext(tx *gorm.DB, runID uuid.UUID) (*ArtifactRunContex
 		return nil, err
 	}
 	if handler == nil {
-		return resolveVisualEvidenceArtifactRun(tx, run)
+		runContext, err := resolveVisualEvidenceArtifactRun(tx, run)
+		if errors.Is(err, ErrArtifactRunScopeNotFound) {
+			return resolveStandaloneCanvasArtifactRun(tx, run)
+		}
+		return runContext, err
 	}
 	if handler.Source != models.FactoryPRFeedbackHandlerSourcePullRequestDiscussion {
 		return nil, ErrArtifactRunScopeNotFound
@@ -164,6 +169,26 @@ func resolveVisualEvidenceArtifactRun(tx *gorm.DB, run *models.CanvasRun) (*Arti
 	}, nil
 }
 
+// resolveStandaloneCanvasArtifactRun scopes a run of a canvas that belongs to
+// no factory to its organization. Such a canvas has no work order to attach
+// artifacts to, so FactoryID and WorkOrderID stay nil.
+func resolveStandaloneCanvasArtifactRun(tx *gorm.DB, run *models.CanvasRun) (*ArtifactRunContext, error) {
+	canvas, err := models.FindUnscopedCanvasInTransaction(tx, run.WorkflowID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrArtifactRunScopeNotFound
+		}
+		return nil, err
+	}
+	if canvas.FactoryID != nil {
+		return nil, ErrArtifactRunScopeNotFound
+	}
+	return &ArtifactRunContext{
+		OrganizationID: canvas.OrganizationID,
+		CanvasID:       run.WorkflowID,
+	}, nil
+}
+
 func visualEvidencePullRequestIdentity(event *models.CanvasEvent) (string, int64, bool) {
 	if event == nil {
 		return "", 0, false
@@ -210,7 +235,8 @@ func MintArtifactUploadToken(signer *jwt.Signer, scope ArtifactUploadScope, ttl 
 	if signer == nil {
 		return "", fmt.Errorf("jwt signer is required")
 	}
-	if scope.OrganizationID == uuid.Nil || scope.FactoryID == uuid.Nil || scope.WorkOrderID == uuid.Nil ||
+	// A standalone canvas run has neither a factory nor a work order; a factory run has both.
+	if scope.OrganizationID == uuid.Nil || (scope.FactoryID == uuid.Nil) != (scope.WorkOrderID == uuid.Nil) ||
 		scope.CanvasID == uuid.Nil || scope.CanvasRunID == uuid.Nil || scope.NodeExecutionID == uuid.Nil ||
 		strings.TrimSpace(scope.NodeID) == "" {
 		return "", fmt.Errorf("artifact upload scope is incomplete")
